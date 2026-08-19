@@ -780,3 +780,83 @@ was scoped to "copy... and test it," not "make BPBreID use this copy instead."
   global-pooled `[2, 2048]` feature; `model.loss = 'part_based'` mode (how BPBreID's own backbone
   wrapper drives it) returns the raw `[2, 2048, 16, 8]` feature map instead, matching what
   `BPBreID.forward()` expects from `self.backbone_appearance_feature_extractor(images)`.
+
+### 2026-08-19 20:23 CST — Full USL logic audit: 1 critical bug, 1 monitoring gap, 2 medium fixes
+
+Per direct instruction: re-read the entire USL path fresh (not from memory) and verified every
+hypothesis empirically before reporting or fixing anything, rather than trusting the earlier
+build-time reasoning at face value.
+
+**🔴 CRITICAL, fixed — the EMA "teacher" was never actually a copy of the student.**
+`examples/train_usl.py::create_model` built `model`/`model_ema` via two *separate*
+`BPBReIDEncoder(...)` constructor calls. Verified empirically before touching anything: **15 of
+409 parameter tensors differed** between the two at initialization, including
+`pixel_classifier.classifier.weight` (the part-attention mechanism itself) and every dim-reduce
+layer. This breaks the entire teacher-student premise every MoCo/BYOL/ICE-style EMA setup depends
+on (the teacher must start byte-identical to the student, only diverging via the momentum update
+afterward) -- and it's especially damaging here because `model_ema` both (a) supplies the view-
+contrastive loss's `k` target and (b) generates the features used for **clustering every epoch**.
+At `alpha=0.999` the initial divergence takes ~3000 iterations (7+ epochs at default settings) to
+substantially wash out, so early pseudo-labels for a real run would come from a teacher with no
+real relationship to the student. Root cause: this is the *same* pattern ICE's own
+`unsupervised_train.py::create_model` uses (two independent `models.create(...)` calls, only
+forced into agreement via `copy_state_dict` from the *same* checkpoint when `args.init != ''`) --
+so this bug is latent in ICE's own reference script too whenever no init checkpoint is given, not
+something introduced fresh here. **Fix**: build one model, `model_ema = copy.deepcopy(model)`.
+Verified: re-ran the same diff check after the fix, 0/409 tensors differ.
+
+**🟠 HIGH, fixed — no diagnostic existed for part-attention collapse.**
+`learnable_attention_enabled=True` means the pixel-to-part classifier is trained from indirect
+gradient alone whenever BPA loss isn't active or is being outweighed by other terms -- a known
+failure mode for weakly-supervised attention. This exact risk was flagged in this project's very
+first sanity-check pass, long before any of the USL work, with "monitor visibility stats" proposed
+as a mitigation -- and never implemented until now. **Fix**: `ICEUSLTrainer.train` now tracks
+`q_vis.float().mean(dim=0)` (mean per-branch visibility rate) across the epoch and prints it at
+epoch end. Verified it actually prints correctly on a real run:
+`Epoch 0 mean part-visibility rate per branch (branch 0 = foreground): ['1.00', '1.00', '1.00',
+'1.00', '1.00', '1.00']` -- a legitimate baseline for a fresh/untrained pixel classifier (nothing
+has learned to differentiate branches yet); a real trained run should show these diverge to more
+varied, occlusion-dependent values, and the diagnostic is now in place to actually observe that
+instead of only ever finding out indirectly from a bad final mAP.
+
+**🟡 MEDIUM, fixed — resize interpolation mismatch between the masked and unmasked img1 paths.**
+`pcr/utils/data/preprocessor.py::PreprocessorMasked` used `TF.resize(img, [h,w])` (defaults to
+bilinear) for view-1's geometric pass, while `get_view2_transform`'s `T.Resize(...,
+interpolation=3)` (bicubic) is used for view-2 and for the *entire* unmasked-path view-1. Whenever
+BPA loss was enabled, the student's primary training view silently got a different resize kernel
+than the teacher's view -- an avoidable pipeline inconsistency. Fixed to explicitly match
+(`interpolation=InterpolationMode.BICUBIC`).
+
+**🟡 MEDIUM, fixed (per explicit direction) — GiLt id-loss's raw scale tracked num_ids, not
+learning progress.** `CrossEntropyLabelSmooth`'s chance-level baseline is ~`log(num_clusters)`,
+and DBSCAN's cluster count is directly observed to swing wildly epoch to epoch on an
+under-trained encoder (335 -> 9 -> 1 in an earlier dummy run) for reasons unrelated to model
+quality. With a fixed `gilt_id_weight`, this term's pull on the total gradient balance shifted
+inconsistently for reasons having nothing to do with training progress. **Fix** (user chose
+"normalize by log(num_ids)" over "leave as-is" or "skip"): `PartGiLtLoss` now divides the id-loss
+by `log(max(num_clusters, 2))` before weighting it into the total loss, while still returning/
+logging the *unnormalized* value (the interpretable "how confident is the classifier" number).
+Verified on a real run: printed `Loss_gilt_id` values (5.24 at 198 clusters, 4.94 at 143 clusters)
+closely track `log(num_ids)` (5.29, 4.96) as expected -- confirms the raw diagnostic stayed
+interpretable while the actual backprop term is now the normalized one.
+
+**Investigated and explicitly ruled out** (checked rigorously, not just assumed correct, so they
+don't need to be re-litigated in a future pass): visibility-score dtype (verified genuinely
+`torch.bool`, not a float lookalike, so the bool/continuous branches in `contrastive.py`/
+`part_triplet_loss.py` both correctly hit their intended path); the 0-similarity fallback for
+zero-mutual-visibility branch pairs in `PartViewContrastiveLoss._combine_similarity` (traced
+through both the hardest-positive selection and the InfoNCE denominator with `T=0.1`'s actual
+dynamic range -- confirmed benign on both sides, not just asserted); diagonal (self-pair)
+inclusion in `PartViewContrastiveLoss` (intentional -- matches MoCo/ICE's own instance-
+discrimination design, q[i] vs k[i] being the same physical image under two augmentations is a
+genuinely valid positive candidate, not an oversight); `PartGiLtLoss`'s `tau_c=0.5` (matches ICE's
+own default exactly, not invented here). Also noted, informational only, not fixed: ShuffleBN
+(`_get_shuffle_ids`) is correct code but is inert on this project's current single-GPU dev setup --
+its whole purpose is decorrelating BN statistics *across* GPUs in `nn.DataParallel`, and batch
+statistics on one GPU are invariant to element ordering regardless of shuffling. Will start doing
+real work automatically once run on 2+ GPUs; not a bug to fix now.
+
+**Verified end-to-end after all four fixes landed together**, not just individually: a real
+training run (`-dt market1501`, `--backbone resnet50`, real masks, GiLt + BPA + VCL all active,
+2 epochs) completed clean, no NaN, no crash, checkpoint saved, visibility diagnostic printing
+correctly each epoch.

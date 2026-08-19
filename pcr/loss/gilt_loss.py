@@ -14,7 +14,19 @@ Branch weighting mirrors bpbreid's own default_losses_weights for the two branch
 repo's encoder actually exposes (foreground + parts; no separate global/concat_parts branches):
 id loss on the foreground branch only (index 0), triplet loss across all M branches (foreground
 + parts) -- matching bpbreid's yaml (`foreg: id=1,tr=1`, `parts: id=0,tr=1`).
+
+The id loss is divided by log(num_clusters) before being weighted into the total loss. Its raw
+scale (CrossEntropyLabelSmooth's chance-level baseline is ~log(num_clusters)) is set entirely by
+DBSCAN's cluster count for that epoch, not by how well the model is learning -- and that count is
+observed to swing wildly (e.g. 335 -> 9 -> 1 across consecutive epochs on an under-trained
+encoder, purely from clustering noise). Left unnormalized, a fixed id_weight would pull the total
+gradient balance around for reasons unrelated to learning progress. The *unnormalized* value is
+still what's returned/logged (id_loss_val below), since the raw cross-entropy is the
+interpretable "how confident is the classifier" number -- only the term actually added to `loss`
+is rescaled.
 """
+import math
+
 import torch.nn as nn
 
 from .crossentropy import CrossEntropyLabelSmooth
@@ -29,6 +41,7 @@ class PartGiLtLoss(nn.Module):
         self.triplet_weight = triplet_weight
         self.id_loss = CrossEntropyLabelSmooth(num_clusters) if id_weight > 0 else None
         self.triplet_loss = PartTripletLoss(margin=triplet_margin) if triplet_weight > 0 else None
+        self.id_loss_norm = math.log(max(num_clusters, 2))
 
     def forward(self, f_out, vis, centers, targets):
         """f_out: [B, M, D] (branch 0 = foreground, per BPBReIDEncoder's convention). vis: [B, M].
@@ -40,7 +53,7 @@ class PartGiLtLoss(nn.Module):
         if self.id_loss is not None:
             logits = (f_out[:, 0, :] @ centers[:, 0, :].t()) / self.tau_c  # [B, num_clusters]
             id_loss_val = self.id_loss(logits, targets)
-            loss = loss + self.id_weight * id_loss_val
+            loss = loss + self.id_weight * (id_loss_val / self.id_loss_norm)
 
         if self.triplet_loss is not None:
             result = self.triplet_loss(f_out, targets, parts_visibility=vis)

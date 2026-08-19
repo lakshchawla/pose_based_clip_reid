@@ -39,6 +39,12 @@ class ICEUSLTrainer(object):
         losses_gilt_id = AverageMeter()
         losses_gilt_tri = AverageMeter()
         losses_bpa = AverageMeter()
+        vis_rate = AverageMeter()  # per-branch mean visibility -- cheap diagnostic for
+                                    # part-attention collapse (learnable_attention_enabled=True
+                                    # means the pixel classifier is trained from indirect gradient
+                                    # alone whenever BPA loss isn't active/dominant; a branch whose
+                                    # visibility rate collapses toward 0 or 1 across an epoch is
+                                    # attending to nothing or everything, not a distinct part)
 
         student = self.encoder.module if isinstance(self.encoder, nn.DataParallel) else self.encoder
 
@@ -67,6 +73,7 @@ class ICEUSLTrainer(object):
             loss_vcl = self.vcl_criterion(q, q_vis, k, k_vis, targets)
             loss = loss_vcl
             losses_vcl.update(loss_vcl.item())
+            vis_rate.update(q_vis.float().mean(dim=0).detach().cpu())
 
             if gilt_criterion is not None:
                 loss_gilt, id_loss_val, triplet_loss_val = gilt_criterion(q, q_vis, centers, targets)
@@ -106,6 +113,9 @@ class ICEUSLTrainer(object):
                               losses_gilt_id.val, losses_gilt_id.avg,
                               losses_gilt_tri.val, losses_gilt_tri.avg,
                               losses_bpa.val, losses_bpa.avg))
+
+        print('Epoch {} mean part-visibility rate per branch (branch 0 = foreground): {}'.format(
+            epoch, ['{:.2f}'.format(v) for v in vis_rate.avg.tolist()]))
 
     @staticmethod
     def _mask_targets(mask, pixels_cls_scores):

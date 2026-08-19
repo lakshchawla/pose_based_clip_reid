@@ -8,6 +8,7 @@ term, and no DSBN (there's no domain split to make BN specific to).
 """
 from __future__ import print_function, absolute_import
 import argparse
+import copy
 import os.path as osp
 import random
 import sys
@@ -124,7 +125,13 @@ def get_test_loader(dataset, height, width, batch_size, workers, testset=None):
 def create_model(args):
     model_cfg = BPBReIDModelCfg(backbone=args.backbone)
     model = BPBReIDEncoder(model_cfg, checkpoint_path=args.checkpoint_path)
-    model_ema = BPBReIDEncoder(model_cfg, checkpoint_path=args.checkpoint_path)
+    # deepcopy, not a second independent construction: an EMA teacher must start byte-identical
+    # to the student (MoCo/BYOL/ICE all require this) -- two separate BPBReIDEncoder(...) calls
+    # each do their own random init for every non-backbone layer (dim-reduce, pixel classifier,
+    # pooling heads), which silently broke this. Confirmed empirically before fixing: 15 of 409
+    # parameter tensors differed between two such calls, including pixel_classifier.weight --
+    # the part-attention mechanism itself.
+    model_ema = copy.deepcopy(model)
     model.cuda()
     model_ema.cuda()
     model = nn.DataParallel(model)

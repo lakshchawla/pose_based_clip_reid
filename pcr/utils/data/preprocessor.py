@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as nnF
 import torchvision.transforms.functional as TF
-from torchvision.transforms import RandomCrop
+from torchvision.transforms import RandomCrop, InterpolationMode
 from torch.utils.data import Dataset
 from PIL import Image
 
@@ -122,7 +122,10 @@ class PreprocessorMasked(Dataset):
         mask = nnF.interpolate(mask.unsqueeze(0), size=(self.height, self.width),
                                 mode='bilinear', align_corners=True).squeeze(0)
 
-        img1 = TF.resize(img, [self.height, self.width])
+        # bicubic, matching get_view2_transform's T.Resize(interpolation=3) -- TF.resize's own
+        # default (bilinear) would otherwise give the student's view a subtly different resize
+        # kernel than the teacher's view whenever masks/BPA loss are enabled
+        img1 = TF.resize(img, [self.height, self.width], interpolation=InterpolationMode.BICUBIC)
         img1 = TF.pad(img1, self.pad)
         mask = nnF.pad(mask, (self.pad, self.pad, self.pad, self.pad))
 

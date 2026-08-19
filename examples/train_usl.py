@@ -122,7 +122,7 @@ def get_test_loader(dataset, height, width, batch_size, workers, testset=None):
 
 
 def create_model(args):
-    model_cfg = BPBReIDModelCfg()
+    model_cfg = BPBReIDModelCfg(backbone=args.backbone)
     model = BPBReIDEncoder(model_cfg, checkpoint_path=args.checkpoint_path)
     model_ema = BPBReIDEncoder(model_cfg, checkpoint_path=args.checkpoint_path)
     model.cuda()
@@ -268,7 +268,12 @@ if __name__ == '__main__':
     parser.add_argument('--k2', type=int, default=6, help="Jaccard re-ranking k2")
     # model / loss
     parser.add_argument('--checkpoint-path', type=str, default='', metavar='PATH',
-                         help="BPBReID checkpoint to initialize both the student and EMA teacher from")
+                         help="BPBReID checkpoint to initialize both the student and EMA teacher "
+                              "from; if omitted, the backbone starts from ImageNet-pretrained "
+                              "weights instead of a fully random init")
+    parser.add_argument('--backbone', type=str, default='hrnet32', choices=['hrnet32', 'resnet50'],
+                         help="resnet50's ImageNet weights auto-download; hrnet32's need a one-time "
+                              "manual download (instructions printed if missing) -- see progress.md")
     parser.add_argument('--alpha', type=float, default=0.999, help="EMA momentum for the teacher model")
     parser.add_argument('--tau-v', type=float, default=0.1, help="temperature for the hard-instance contrastive loss")
     # GiLt (id-via-cluster-centers + part-triplet)

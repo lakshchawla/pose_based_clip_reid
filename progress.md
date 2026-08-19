@@ -696,3 +696,87 @@ re-cluster next epoch instead of crashing.
 
 **Not done in this pass** (per explicit scope): `train_uda.py` untouched; horizontal-stripes option;
 hard triplet (source, UDA) / soft triplet (open design question) from the earlier plan's items 3-4.
+
+### 2026-08-19 — Fixed: backbone was never actually getting ImageNet-pretrained weights
+
+Root cause: `BPBReIDEncoder.__init__` always called `BPBreID(..., pretrained=False, ...)`
+unconditionally, regardless of backbone or whether a full checkpoint was given — so any run
+without an external bpbreid checkpoint (in particular `train_usl.py` with no `--checkpoint-path`,
+which is a supported/default mode) started from a **fully random** backbone, not ImageNet-init.
+Both `hrnet32` and `resnet50` were already correctly registered in torchreid's model factory and
+already threaded through `BPBReIDModelCfg.backbone` — the gap was specifically the hardcoded
+`pretrained=False`, not missing backbone support.
+
+Researched both backbones' actual weight-sourcing before changing anything (see the research
+agent's findings, summarized here since they directly shaped the fix):
+- **resnet50**: `torchreid/models/resnet.py::init_pretrained_weights` uses
+  `torch.utils.model_zoo.load_url('https://download.pytorch.org/models/resnet50-19c8e357.pth')`
+  — a real, stable, auto-downloading path, caching under `~/.cache/torch/hub/checkpoints/` (or
+  `~/.cache/torch/checkpoints/` on older torch). Verified directly: constructed a resnet50-backed
+  `BPBReIDEncoder` with `pretrained=True`, confirmed the exact expected file
+  (`resnet50-19c8e357.pth`, 102MB) was loaded from cache and a forward pass produced correctly-
+  shaped output.
+- **hrnet32**: no stable URL exists anywhere in bpbreid's repo or docs for the raw ImageNet-only
+  weights (`hrnetv2_w32_imagenet_pretrained.pth`) — `default_config.py`'s own comment says
+  "download on our Google Drive" without giving a link/ID, `README.md`'s Google Drive link is for
+  full *fine-tuned* bpbreid checkpoints (unconfirmed whether the raw ImageNet file is even in
+  there), and there's no download script anywhere in the repo. **Did not fabricate a URL or guess
+  a gdown ID** — auto-downloading against an unverified link risks silently fetching the wrong
+  file. Instead, added a fail-fast check.
+
+**Fix (`pcr/models/bpbreid_encoder.py`):**
+- `pretrained = not checkpoint_path` — ImageNet-init the backbone whenever no full bpbreid
+  checkpoint is going to overwrite it anyway (a full checkpoint's matching-shape weights get
+  loaded over it afterward via the existing `load_pretrained_weights` call regardless, so
+  requesting ImageNet init in that case would just be wasted download/compute).
+- When `backbone == 'hrnet32'` and `pretrained` is true, check for
+  `<hrnet_pretrained_path>/hrnetv2_w32_imagenet_pretrained.pth` *before* attempting model
+  construction; raise `FileNotFoundError` with copy-pasteable instructions (both official sources,
+  the exact expected path, and "use `--backbone resnet50` instead" as the zero-setup alternative)
+  rather than letting it fail deep inside bpbreid's own `HighResolutionNet.load_param`. Verified
+  this actually fires correctly (file genuinely absent in this environment).
+- `BPBReIDModelCfg.hrnet_pretrained_path` default changed from `''` to `'pretrained_models'`,
+  matching bpbreid's own yacs default.
+- `--backbone` (`hrnet32`/`resnet50`) added to both `examples/train_uda.py` and `examples/
+  train_usl.py`, threaded into `BPBReIDModelCfg(backbone=args.backbone)`. Default stays `hrnet32`
+  in both (no behavior change for existing users/configs that already assume it, e.g. the
+  `parts_num=5` gotcha tied to bpbreid's hrnet32-based yaml configs is unaffected by this — that's
+  a masks-config axis, independent of backbone choice) — `resnet50` is the new, fully zero-setup
+  option for anyone without a pretrained checkpoint or the manually-downloaded HRNet file. In
+  `train_uda.py`, `--checkpoint-path` stays `required=True` (unchanged design: source pretraining
+  is external, per this repo's original PLAN.md) so the ImageNet-fallback path mainly matters for
+  `train_usl.py`, where `--checkpoint-path` is optional by design.
+
+**Verified, not assumed:** both the hrnet32 fail-fast error and the resnet50 real-weights-loaded
+path were actually run and their output inspected (not just read as "should work" from the code).
+
+### 2026-08-19 — Vendored resnet50's backbone code into pcr2 directly
+
+Per direct instruction: copied bpbreid's `torchreid/models/resnet.py` into `pcr/models/resnet.py`
+rather than continuing to rely solely on the externally-installed torchreid package for it.
+Checked first, not assumed: this file's only imports are `torch` and `torch.utils.model_zoo` —
+zero references to `torchreid.losses`/`torchreid.utils`/anything else in that package, so there
+was no actual dependency tree to bring along despite the request anticipating one ("models losses
+utils etc") — copying the single file is the complete, correct vendoring, not a partial one.
+
+**Not wired into the training pipeline** — `BPBReIDEncoder(backbone='resnet50')` still resolves
+`'resnet50'` through torchreid's own internal model registry (that's an implementation detail
+inside bpbreid's own `BPBreID.__init__` -> `models.build_model(...)`, not something this repo's
+code controls), so this vendored copy doesn't change what the existing `--backbone resnet50` flag
+does. It's a separate, standalone module for direct use (e.g. a plain non-part-based baseline
+encoder, if one gets built later) — flagged to the user as not yet integrated, since the request
+was scoped to "copy... and test it," not "make BPBreID use this copy instead."
+
+**Verified rigorously, not just "imports cleanly":**
+- `from pcr.models.resnet import resnet50; resnet50(num_classes=751, loss='softmax',
+  pretrained=True, last_stride=1)` — real ImageNet weights load correctly through this vendored
+  file specifically.
+- Checked via **exact tensor equality** against the downloaded checkpoint
+  (`~/.cache/torch/hub/checkpoints/resnet50-19c8e357.pth`), not just "non-random-looking stats"
+  (which is what the earlier verification of the *external* torchreid resnet50 relied on) —
+  `torch.equal(model.conv1.weight, ref['conv1.weight'])` and the same for a deep layer
+  (`layer4.2.conv3.weight`) both returned `True`.
+- Forward pass verified in both modes the backbone is actually used in: standard mode returns a
+  global-pooled `[2, 2048]` feature; `model.loss = 'part_based'` mode (how BPBreID's own backbone
+  wrapper drives it) returns the raw `[2, 2048, 16, 8]` feature map instead, matching what
+  `BPBreID.forward()` expects from `self.backbone_appearance_feature_extractor(images)`.

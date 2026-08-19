@@ -89,7 +89,7 @@ def get_test_loader(dataset, height, width, batch_size, workers, testset=None):
 
 
 def create_model(args):
-    model_cfg = BPBReIDModelCfg()
+    model_cfg = BPBReIDModelCfg(backbone=args.backbone)
     model = BPBReIDEncoder(model_cfg, checkpoint_path=args.checkpoint_path)
     # adopt domain-specific BN
     convert_dsbn(model)
@@ -363,6 +363,8 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint-path', type=str, required=True, metavar='PATH',
                          help="BPBReID checkpoint (pretrained on the source domain via "
                               "bpbreid's own torchreid/scripts/main.py) to load into the encoder")
+    parser.add_argument('--backbone', type=str, default='hrnet32', choices=['hrnet32', 'resnet50'],
+                         help="must match whatever backbone --checkpoint-path was pretrained with")
     # optimizer
     parser.add_argument('--lr', type=float, default=0.00035, help="learning rate")
     parser.add_argument('--weight-decay', type=float, default=5e-4)

@@ -1,9 +1,21 @@
 from __future__ import absolute_import
 
 from torchvision.transforms import *
-from PIL import Image
+from PIL import Image, ImageFilter
 import random
 import math
+
+
+class GaussianBlur(object):
+    """Gaussian blur augmentation from SimCLR (https://arxiv.org/abs/2002.05709), used by
+    ICE's USL pipeline to decorrelate its two augmented views of the same image."""
+
+    def __init__(self, sigma=(.1, 2.)):
+        self.sigma = sigma
+
+    def __call__(self, x):
+        sigma = random.uniform(self.sigma[0], self.sigma[1])
+        return x.filter(ImageFilter.GaussianBlur(radius=sigma))
 
 
 class RectScale(object):

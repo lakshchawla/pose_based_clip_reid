@@ -76,3 +76,28 @@ class BPBReIDEncoder(nn.Module):
         vis = torch.cat([foreground_vis.unsqueeze(1), parts_vis], dim=1)  # [B, 1+K]
 
         return f_out, vis
+
+    def forward_full(self, images):
+        """Like forward(), but also returns pixels_cls_scores [B, K, Hf, Wf] (needed by
+        BodyPartAttentionLoss). A separate method rather than an always-3-tuple forward() so
+        every existing caller (trainers, evaluators, memory init) keeps working unchanged --
+        the tradeoff is that this method isn't nn.DataParallel-aware: call it on the unwrapped
+        module (`model.module.forward_full(...)` if `model` is DataParallel-wrapped), which
+        runs on a single device. Fine for this repo's single-GPU dev setup; would need
+        revisiting (e.g. always returning the 3-tuple from forward() instead) to actually
+        scale BPA loss across multiple GPUs.
+        """
+        embeddings, visibility_scores, _, pixels_cls_scores, _, _ = self.model(images)
+
+        foreground_emb = embeddings[BN_FOREGROUND]
+        parts_emb = embeddings[BN_PARTS]
+        foreground_vis = visibility_scores[FOREGROUND]
+        parts_vis = visibility_scores[PARTS]
+
+        f_out = torch.cat([foreground_emb.unsqueeze(1), parts_emb], dim=1)
+        f_out = F.normalize(f_out, p=2, dim=-1)
+        vis = torch.cat([foreground_vis.unsqueeze(1), parts_vis], dim=1)
+
+        return f_out, vis, pixels_cls_scores
+
+

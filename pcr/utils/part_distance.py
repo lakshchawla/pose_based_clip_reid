@@ -3,15 +3,15 @@
 Ported from bpbreid's torchreid/metrics/distance.py
 (compute_distance_matrix_using_bp_features + _compute_body_parts_dist_matrices) and
 torchreid/utils/tensortools.py (masked_mean/replace_values). Dropped: Writer telemetry
-hooks (bpbreid-internal debugging, not needed here), the use_gpu-driven .cuda() calls and
-gallery batching (this repo always runs on modest re-ID gallery sizes, so a single dense
-[Nq, Ng] pass is simpler and numerically identical to the batched original).
+hooks (bpbreid-internal debugging, not needed here).
 
 This is THE explicit part-based matching function reused by jaccard_rerank.py (as the base
 distance for k-reciprocal re-ranking) and evaluators.py (query-gallery matching at eval time).
 """
 import torch
 from torch.nn import functional as F
+
+DEFAULT_BATCH_SIZE = 1024
 
 
 def replace_values(input, mask, value):
@@ -46,58 +46,71 @@ def _compute_body_parts_dist_matrices(qf, gf, metric='euclidean'):
     return distances
 
 
-def _bool_visibility_distance(qf, gf, qf_vis, gf_vis, dist_combine_strat, metric):
-    body_part_dist = _compute_body_parts_dist_matrices(qf, gf, metric)  # [M, Nq, Ng]
-
-    qf_vis_t = qf_vis.t()  # [M, Nq]
-    gf_vis_t = gf_vis.t()  # [M, Ng]
-    valid_mask = qf_vis_t.unsqueeze(2) * gf_vis_t.unsqueeze(1)  # [M, Nq, Ng] bool, mutual visibility
-
-    if dist_combine_strat == 'max':
-        masked_dist = replace_values(body_part_dist, ~valid_mask, -1)
-        pairwise_dist, _ = masked_dist.max(dim=0)
-    elif dist_combine_strat == 'mean':
-        pairwise_dist = masked_mean(body_part_dist, valid_mask)
+def _combine_chunk(body_part_dist, qf_vis_t, gf_vis_chunk_t, dist_combine_strat, is_bool):
+    """body_part_dist: [M, Nq, chunk]. qf_vis_t: [M, Nq]. gf_vis_chunk_t: [M, chunk]."""
+    if is_bool:
+        valid_mask = qf_vis_t.unsqueeze(2) * gf_vis_chunk_t.unsqueeze(1)  # [M, Nq, chunk]
+        if dist_combine_strat == 'max':
+            masked_dist = replace_values(body_part_dist, ~valid_mask, -1)
+            pairwise_dist, _ = masked_dist.max(dim=0)
+        elif dist_combine_strat == 'mean':
+            pairwise_dist = masked_mean(body_part_dist, valid_mask)
+        else:
+            raise ValueError('Body parts distance combination strategy "{}" not supported'.format(dist_combine_strat))
     else:
-        raise ValueError('Body parts distance combination strategy "{}" not supported'.format(dist_combine_strat))
-
-    # sentinel: pairs with zero mutual visibility across every branch get "max observed + 1"
-    max_value = body_part_dist.max() + 1
-    invalid_mask = (pairwise_dist == -1)
-    pairwise_dist = replace_values(pairwise_dist, invalid_mask, max_value)
+        soft_mask = torch.sqrt(qf_vis_t.unsqueeze(2) * gf_vis_chunk_t.unsqueeze(1))
+        pairwise_dist = masked_mean(body_part_dist, soft_mask)
     return pairwise_dist
 
 
-def _soft_visibility_distance(qf, gf, qf_vis, gf_vis, dist_combine_strat, metric):
-    body_part_dist = _compute_body_parts_dist_matrices(qf, gf, metric)  # [M, Nq, Ng]
-
-    qf_vis_t = qf_vis.t()  # [M, Nq]
-    gf_vis_t = gf_vis.t()  # [M, Ng]
-    soft_mask = torch.sqrt(qf_vis_t.unsqueeze(2) * gf_vis_t.unsqueeze(1))  # [M, Nq, Ng]
-
-    pairwise_dist = masked_mean(body_part_dist, soft_mask)
-
-    max_value = body_part_dist.max() + 1
-    invalid_mask = (pairwise_dist == -1)
-    pairwise_dist = replace_values(pairwise_dist, invalid_mask, max_value)
-    return pairwise_dist
-
-
-def compute_bpb_pairwise_distance(qf, qf_vis, gf=None, gf_vis=None, dist_combine_strat='mean', metric='euclidean'):
+def compute_bpb_pairwise_distance(qf, qf_vis, gf=None, gf_vis=None, dist_combine_strat='mean',
+                                   metric='euclidean', batch_size=DEFAULT_BATCH_SIZE):
     """Part-based pairwise distance between two sets of BPBReID embeddings.
 
     qf, gf: [N, M, D] per-branch (foreground + K parts) embeddings.
     qf_vis, gf_vis: [N, M] visibility, either bool (hard) or float in [0, 1] (soft).
     If gf/gf_vis are omitted, computes the self-distance qf vs qf (used by Jaccard re-ranking).
 
+    Processes the gallery in chunks of `batch_size` so the [M, Nq, Ng] per-branch distance
+    tensor is never fully materialized at once -- the target-domain self-distance used by
+    Jaccard re-ranking runs over the entire target training set (tens of thousands of images),
+    and a dense one-shot [M, N, N] pass OOMs well before that on a consumer GPU (verified: a
+    16522x6x512 self-distance needs ~6.5GB for that one intermediate, more than an 8GB card has
+    free alongside everything else). The "sentinel = max observed distance + 1" value for
+    zero-mutual-visibility pairs is computed as a running max across chunks so it stays a true
+    global max, not a per-chunk one. Only the combined [Nq, Ng] result is returned -- unlike
+    bpbreid's own two-return-value API, nothing here needs the per-branch distance matrix.
+
     Returns: Tensor[Nq, Ng] distance matrix.
     """
     if gf is None:
         gf, gf_vis = qf, qf_vis
 
-    if qf_vis.dtype == torch.bool and gf_vis.dtype == torch.bool:
-        return _bool_visibility_distance(qf, gf, qf_vis, gf_vis, dist_combine_strat, metric)
-    else:
+    is_bool = qf_vis.dtype == torch.bool and gf_vis.dtype == torch.bool
+    if not is_bool:
         qf_vis = qf_vis.float()
         gf_vis = gf_vis.float()
-        return _soft_visibility_distance(qf, gf, qf_vis, gf_vis, dist_combine_strat, metric)
+
+    qf_vis_t = qf_vis.t()  # [M, Nq]
+    Nq, Ng = qf.size(0), gf.size(0)
+
+    # Written in-place chunk-by-chunk instead of accumulated in a Python list + torch.cat:
+    # holding all ~Ng/batch_size chunks alive until a final cat roughly doubles peak memory
+    # right when it matters most (this runs concurrently with the resident model/optimizer).
+    pairwise_dist = torch.empty(Nq, Ng, device=qf.device, dtype=qf.dtype)
+    running_max = torch.zeros((), device=qf.device, dtype=qf.dtype)
+    for start in range(0, Ng, batch_size):
+        end = min(start + batch_size, Ng)
+        gf_chunk = gf[start:end]
+        gf_vis_chunk_t = gf_vis[start:end].t()  # [M, chunk]
+
+        body_part_dist = _compute_body_parts_dist_matrices(qf, gf_chunk, metric)  # [M, Nq, chunk]
+        running_max = torch.maximum(running_max, body_part_dist.max())
+
+        pairwise_dist[:, start:end] = _combine_chunk(body_part_dist, qf_vis_t, gf_vis_chunk_t,
+                                                       dist_combine_strat, is_bool)
+        del body_part_dist
+
+    max_value = running_max + 1
+    pairwise_dist.masked_fill_(pairwise_dist == -1, max_value)
+    return pairwise_dist

@@ -99,3 +99,58 @@ class RandomMultipleGallerySampler(Sampler):
                     ret.append(index[kk])
 
         return iter(ret)
+
+
+class MoreCameraSampler(Sampler):
+    """PK sampler that prefers spreading each identity's instances across distinct cameras
+    (one per camera first, top up with random extras only if the identity doesn't span enough
+    cameras) -- ICE's own choice of sampler for its USL pipeline, since the hard-instance
+    contrastive loss benefits from same-identity positives that already look visually different
+    (different camera) rather than near-duplicate frames from the same camera."""
+
+    def __init__(self, data_source, num_instances=4):
+        self.data_source = data_source
+        self.pid_cam = defaultdict(list)
+        self.pid_index = defaultdict(list)
+        self.num_instances = num_instances
+
+        for index, (_, pid, cam) in enumerate(data_source):
+            if pid < 0:
+                continue
+            self.pid_cam[pid].append(cam)
+            self.pid_index[pid].append(index)
+
+        self.pids = list(self.pid_index.keys())
+        self.num_samples = len(self.pids)
+
+    def __len__(self):
+        return self.num_samples * self.num_instances
+
+    def __iter__(self):
+        indices = torch.randperm(len(self.pids)).tolist()
+        ret = []
+
+        for kid in indices:
+            pid = self.pids[kid]
+            cams = np.array(self.pid_cam[pid])
+            index = np.array(self.pid_index[pid])
+
+            select_indexes = []
+            for cam in set(self.pid_cam[pid]):
+                select_indexes.append(np.random.choice(index[cams == cam], size=1, replace=False))
+            select_indexes = np.concatenate(select_indexes)
+
+            if len(select_indexes) < self.num_instances:
+                diff_indexes = np.setdiff1d(index, select_indexes)
+                need = self.num_instances - len(select_indexes)
+                if len(diff_indexes) == 0:
+                    select_indexes = np.random.choice(select_indexes, size=self.num_instances, replace=True)
+                else:
+                    diff_indexes = np.random.choice(diff_indexes, size=need, replace=len(diff_indexes) < need)
+                    select_indexes = np.concatenate([select_indexes, diff_indexes])
+            else:
+                select_indexes = np.random.choice(select_indexes, size=self.num_instances, replace=False)
+
+            ret.extend(select_indexes.tolist())
+
+        return iter(ret)

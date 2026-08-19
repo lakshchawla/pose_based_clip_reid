@@ -99,3 +99,19 @@ class PCRTrainer_UDA(object):
 
     def _forward(self, inputs):
         return self.encoder(inputs)
+
+
+
+"""
+
+implement loss functions required in this repository including the following:
+  1. Bpbreid based BPA loss, body part attention module to pifpaf segmentation pre-predicted maps
+  2. Body part triplet loss
+  3. Option to select horizontal stripes.
+  4. Hard triplet loss and soft triplet loss.
+  
+  Write a plan for implementing these fitting with SPCL skeleton and training flow, and also respecting the source and target dataset segregation, layout the complete concept which loss would fit
+  where inside the training pipeline (just in all the above losses, if theres anything else specific declare it before in a list before writing the plan). Log the plan in progress.md with todays
+  date and timestamp.
+
+"""

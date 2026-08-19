@@ -46,7 +46,11 @@ class DSBN1d(nn.Module):
 
 def convert_dsbn(model):
     for _, (child_name, child) in enumerate(model.named_children()):
-        assert not next(model.parameters()).is_cuda
+        # BPBReID's parameter-free pooling-head wrappers (e.g. GlobalAveragePoolingHead's
+        # sole child is an nn.Identity()) make next(model.parameters()) raise StopIteration --
+        # nothing to check for cuda-ness in that case, so treat "no params" as "not cuda".
+        first_param = next(model.parameters(), None)
+        assert first_param is None or not first_param.is_cuda
         if isinstance(child, nn.BatchNorm2d):
             m = DSBN2d(child.num_features)
             m.BN_S.load_state_dict(child.state_dict())
@@ -63,7 +67,8 @@ def convert_dsbn(model):
 
 def convert_bn(model, use_target=True):
     for _, (child_name, child) in enumerate(model.named_children()):
-        assert not next(model.parameters()).is_cuda
+        first_param = next(model.parameters(), None)
+        assert first_param is None or not first_param.is_cuda
         if isinstance(child, DSBN2d):
             m = nn.BatchNorm2d(child.num_features)
             if use_target:

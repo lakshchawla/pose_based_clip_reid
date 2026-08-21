@@ -1286,6 +1286,167 @@ wiring into `pcr/trainers.py::PCRTrainer_UDA` and `examples/train_uda.py`, execu
 already drafted in this file's 2026-08-19 15:58 entry for the UDA path specifically) -- paused
 here for review.
 
+### 2026-08-21 17:01 CST — Stage 6 done: GiLt (id+triplet) + BPA loss wired into
+### `PCRTrainer_UDA`/`train_uda.py`, one real bug found and fixed by reading a suspicious metric
+
+Executes the plan already drafted in this file's 2026-08-19 15:58 entry for the UDA path
+specifically (that entry was only executed for `train_usl.py` at the time). **Not a reuse of
+`PartGiLtLoss`** (which classifies against per-epoch DBSCAN cluster centers -- the right fit for
+USL's ever-changing pseudo-label numbering, wrong for source's real, static labels): source id
+loss uses `PartIdClassifiers` (Stage 4's persistent `nn.Linear` head module, reused directly) +
+`CrossEntropyLabelSmooth`; triplet loss uses `PartTripletLoss` directly for both source and target.
+Both are constructor args on `PCRTrainer_UDA` now, not per-`.train()`-call arguments like
+`ICEUSLTrainer`'s GiLt -- no per-epoch rebuild needed once labels are real/static.
+
+**`pcr/trainers.py::PCRTrainer_UDA`** gains `id_classifiers`/`id_criterion`/`triplet_criterion`/
+`id_weight`/`triplet_weight`/`bpa_criterion`/`bpa_weight` constructor args (all optional, default
+off). Per-iteration: id loss on source only (`f_out_s` through `PartIdClassifiers`, branch 0);
+triplet loss on **both** source (real labels) and target (target's actual DBSCAN pseudo-cluster
+label -- see bug below); BPA loss on source only, gated behind a genuinely different forward path
+(`_forward_full`, new method) since it needs `pixels_cls_scores` from `BPBReIDEncoder.forward_full`.
+
+**Real correctness constraint investigated before writing any code, not discovered by accident**:
+`pcr/models/dsbn.py::DSBN2d/DSBN1d.forward` splits *any* batch handed to it exactly in half by
+*position* -- first half always through `BN_S`, second half through `BN_T`, with zero awareness of
+what the caller intends. This means BPA loss cannot call `forward_full` on a source-only sub-batch
+(it would silently misroute half of those source images through the target BatchNorm branch and
+corrupt its running statistics) -- it must be fed the *whole* joint `[source_half; target_half]`
+batch in one call, exactly like the existing memory-loss forward, then `pixels_cls_scores[:B//2]`
+(source's positional half) is what stays correct. Implemented that way; `_forward_full` still
+bypasses `nn.DataParallel`'s scatter/gather (same accepted single-GPU-only tradeoff already
+documented for `ICEUSLTrainer`'s masked path and `BPBReIDEncoder.forward_full` itself), gated
+behind `bpa_criterion is not None` so the default (BPA off) path is completely unchanged from
+before this stage -- zero regression risk for the already-verified plain-memory-loss behavior.
+
+**One real bug, found by noticing a suspicious metric during the smoke run, not by inspection**:
+first smoke run's `Loss_gilt_tri_t` printed exactly `0.000` on nearly every logged iteration --
+too suspiciously exact to wave away as "small value rounds to 0.000." Root cause: the target
+triplet call used `t_indexes + self.source_classes` (copied from the adjacent memory-loss line)
+as the identity label passed to `PartTripletLoss`. `t_indexes` is `PartHybridMemory`'s per-image
+memory-slot index -- by construction unique to *every individual image*, correct for addressing
+memory slots (SpCL's own original design: one memory slot per target image, with a *separate*
+`memory.labels` lookup table doing the pseudo-cluster grouping internally), but never shared
+between two different images -- so `PartTripletLoss`'s same-label positive-pair search could only
+ever succeed by the sampler coincidentally drawing the exact same image twice (`RandomMultiple
+GallerySampler`'s replace=True duplication for under-populated pseudo-identities), explaining both
+the frequent "no valid triplets" warnings and the suspiciously-exact zero on the rare "successes"
+(a duplicated image's self-distance is ~0). **Fixed**: `_parse_data`'s already-returned (but
+previously discarded via `_`) `pids` field -- which for target data *is* the real DBSCAN
+pseudo-label, since `pseudo_labeled_dataset`'s tuples are built with the pseudo-label in that
+position -- is now captured as `t_pseudo_labels` and used for the triplet call; `t_indexes` stays
+reserved for the memory loss only, its original and only correct use. Verified the fix actually
+changed behavior, not just silenced the symptom: re-ran the smoke test and `Loss_gilt_tri_t` now
+shows genuine varying nonzero values (0.240, 0.261, 0.277) instead of a constant suspicious 0.000.
+
+**Verified, in order:**
+1. Full repo `python -m py_compile` sweep -- clean throughout.
+2. `--setup-only` dry run (`--backbone resnet50`, real DukeMTMC->Market1501 data, GiLt on by
+   default, BPA off): "GiLt on, BPA off" printed correctly, memory/encoder shapes as expected.
+3. Real smoke run, **GiLt path** (`-ds dukemtmc-reid -dt market1501`, 2 epochs x 10 iters,
+   random-init resnet50): completed clean, no NaN/crash, `Loss_gilt_id`/`Loss_gilt_tri_s` finite
+   and varying every iteration; `Loss_gilt_tri_t` initially suspicious (see bug above), confirmed
+   genuinely fixed after the correction. mAP 0.8%/top-1 2.4% -- expected near-random for a 20-
+   iteration random-init smoke run, consistent with every prior UDA dummy run in this file.
+4. Real smoke run, **BPA path** (`-ds market1501 -dt dukemtmc-reid --masks-dir
+   pifpaf_maskrcnn_filtering`, exercising `_forward_full`/the joint-batch positional-split
+   handling for the first time on the UDA path): completed clean, no NaN/crash, `Loss_bpa` finite
+   every iteration (~1.79-1.87, same order of magnitude as Stage 4's and `train_usl.py`'s own BPA
+   smoke runs). A first pass at `--iters 10` showed `Loss_gilt_tri_t` at a constant 0.000 the
+   whole run; re-ran at `--iters 40` specifically to get more statistical signal before concluding
+   anything, and confirmed nonzero values (0.277, 0.157) do appear once enough batches succeed --
+   settling that the all-zero result was small-sample variance (mostly-singleton target pseudo-
+   ids at this tiny smoke scale), not a residual bug, rather than assuming either way.
+5. Full repo `python -m py_compile` + `import pcr` sweep after all fixes landed -- clean in
+   `pcr2-run`.
+
+**Not done in this stage, out of scope per the approved plan**: horizontal-stripes mode,
+hard/soft-triplet-loss variants (both still only in the "planned, not built" state from this
+file's 2026-08-19 15:58 entry).
+
+### 2026-08-21 18:34 CST — Stage 7 done: orchestration + docs. Plan complete.
+
+**New file: `examples/run_pipeline.py`** -- thin sequential orchestrator (Stage 1 prompts ->
+Stage 2 finetune -> Stage 3 UDA/USL/none, per `reid_pipeline_plan.md` section 6). Shells out to
+each stage's own script as a separate `subprocess.run` call rather than importing them as library
+functions -- all four stage scripts are `if __name__ == '__main__':`-driven with process-global
+state (`sys.stdout` reassignment via `Logger`, CUDA context, argparse), never designed to run
+twice in one process. `argparse.parse_known_args()` splits the orchestrator's own flags
+(`--stage1-config`/`--stage2-config`/`--stage3`/`--python`) from everything else, which is passed
+straight through verbatim to whichever Stage 3 script runs. The one piece of real logic: Stage 1
+-> Stage 2 wiring needs nothing (already config-file-driven, Stage 2's own YAML names the Stage 1
+output directory it reads from), but Stage 2 -> Stage 3 crosses the YAML/argparse boundary, so the
+orchestrator computes `{stage2 logs_dir}/model_best.pth.tar` and auto-injects it as Stage 3's
+`--checkpoint-path` (plus `--backbone`, matching Stage 2's config) *unless* the user already
+supplied either flag explicitly. A pre-flight check compares Stage 1's `logging.logs_dir` against
+Stage 2's `stage1.prompt_dir` and warns (not hard-fails, in case intentional) on mismatch, so a
+likely misconfiguration is caught before burning a full Stage 1 run rather than after.
+
+**Verified with a genuine end-to-end run, not just each piece read in isolation** -- this is the
+one place in the whole plan where three previously-independently-verified stages get chained
+together for the first time, so the actual hand-off (not each stage's own internals, already
+proven in Stages 3/4/6) is what needed checking:
+1. `python -m py_compile` -- clean.
+2. Isolated unit checks (`flag_present`, `parse_known_args` separation, the mismatch-detection
+   comparison) run directly against the module's own functions -- all correct, including a
+   deliberately-constructed mismatched-config case that correctly printed the warning.
+3. **Real full run**: fresh Stage 1 (1 epoch, Market1501) -> fresh Stage 2 (1 epoch, reading
+   Stage 1's actual output) -> Stage 3 `train_uda.py --setup-only` with *no* manually-supplied
+   `--checkpoint-path`/`--backbone`. Confirmed from the orchestrator's own printed command that it
+   correctly auto-filled `--checkpoint-path logs/dummy_pipeline_stage2/model_best.pth.tar
+   --backbone resnet50` ahead of the user's pass-through args, and -- the actual proof this
+   works, not just that the right flags were assembled -- Stage 3's own log printed **"Successfully
+   loaded pretrained weights from 'logs/dummy_pipeline_stage2/model_best.pth.tar'"**, confirming
+   bpbreid's own checkpoint loader (the same loader stress-tested in Stage 4's bit-for-bit
+   round-trip check) accepted the auto-computed path and loaded it without a discarded-layers
+   warning. All three subprocess stages exited 0; Stage 1 saved its prompt/prototype files, Stage
+   2 trained one epoch and evaluated (mAP 8.7%), Stage 3's setup completed cleanly.
+4. Full repo `python -m py_compile` + `import pcr` sweep -- clean in `pcr2-run`.
+
+**Docs**: `README.md` rewritten to document the full pipeline (was UDA-only before this plan) --
+install (including the new CLIP dependency), per-stage run commands, the orchestrator, the
+external-bpbreid-pretraining alternative (still supported, unchanged), and a note on the fusion
+module's standalone status.
+
+---
+
+## Plan complete: `reid_pipeline_plan.md` gap closed
+
+All seven stages of the approved plan
+(`/home/lakshh/.claude/plans/in-this-repo-cleanly-refactored-river.md`) are done. Summary of what
+this plan added on top of the substantial BPBreID+SPCL pipeline that already existed (see this
+file's history above Stage 0):
+
+- **Net-new**: the entire CLIP-ReID component -- `pcr/models/{clip_text_encoder,prompt_learner}.py`,
+  `pcr/loss/{clip_supcon_loss,clip_i2t_loss}.py`, `pcr/models/id_classifier.py`,
+  `examples/{train_prompts,train_finetune}.py` + their YAML configs, faithfully following
+  CLIP-ReID's actual verified implementation (multi-positive SupCon in Stage 1, frozen-prototype
+  cross-entropy alignment in Stage 2) rather than the plan document's simplified pseudocode, with
+  that deviation documented at the point it was made.
+- **Net-new**: `pcr/models/fusion_head.py::FusionHead`, a standalone single-descriptor fusion
+  module (not wired into any script, matching the plan's own framing of it as an optional
+  ANN/FAISS-retrieval convenience).
+- **Gap closed**: GiLt (id+triplet) and BPA loss terms, previously wired into `train_usl.py` only,
+  now also available in `train_uda.py` via the same `PCRTrainer_UDA` class, correctly respecting
+  DSBN's positional source/target batch split and using real static source labels rather than
+  per-epoch cluster centers.
+- **Orchestration + docs**: `examples/run_pipeline.py` chains all of the above with the
+  pre-existing UDA/USL drivers into one runnable pipeline; `README.md` documents the whole thing.
+
+Bugs found and fixed along the way, every one via actually running the code rather than static
+review alone (consistent with this project's established discipline): a `GradScaler`/fp16-leaf-
+parameter incompatibility (Stage 3), a PyYAML scientific-notation parsing gotcha (Stage 3), a
+numpy-scalar checkpoint incompatibility with bpbreid's own loader (Stage 4), a crash risk from an
+all-invisible sub-batch and a duplicated helper (caught by `/code-review high`, both fixed), and a
+mislabeled target-triplet identity (Stage 6, caught by noticing a suspiciously-exact zero metric
+rather than trusting "no crash, no NaN" alone). None of these were visible from reading the code;
+all were found by running it against real data and, in several cases, by treating a
+too-clean-looking number as a reason to look closer rather than a reason to move on.
+
+**Out of scope, not done, still open** (all pre-existing observations from before this plan,
+re-confirmed rather than silently dropped): horizontal-stripes mode, hard/soft-triplet-loss
+variants, CA-Jaccard/camera-aware clustering, `--resume` support for `train_uda.py`. None of these
+were part of the approved plan's seven stages.
+
 ### 2026-08-21 02:02 CST — Full-pipeline code review (Stages 0-5), three findings, all fixed
 
 Ran `/code-review high` against the complete working-tree diff (everything uncommitted since

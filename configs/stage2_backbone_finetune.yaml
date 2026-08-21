@@ -1,0 +1,55 @@
+# Stage 2: supervised backbone finetune. BPBreID backbone + attention are trainable; Stage 1's
+# prompts/CLIP text encoder are frozen (Stage 1's frozen text-prototype table is loaded from
+# stage1.prompt_dir, not recomputed here). See examples/train_finetune.py.
+
+model:
+  backbone: hrnet32          # must match stage1's model.backbone -- see stage1.prompt_dir note below
+  checkpoint_path: ''        # should match stage1's model.checkpoint_path, so this stage starts
+                              # finetuning from the same point stage1's prompts were trained
+                              # against; empty = ImageNet init
+  dim_reduce_output: 512
+  parts_num: 5
+
+stage1:
+  # directory produced by examples/train_prompts.py -- only text_prototypes.pth is read here
+  # (prompt_learner.pth itself isn't needed, its whole job was producing that frozen table)
+  prompt_dir: examples/logs/stage1_prompts
+
+data:
+  dataset: market1501         # or dukemtmc-reid
+  data_dir: /home/lakshh/workspace/reid/datasets
+  height: 384
+  width: 128
+  batch_size: 32
+  num_instances: 4             # PK sampling: batch_size // num_instances identities per batch
+  workers: 4
+  masks_dir: ''                 # e.g. 'pifpaf_maskrcnn_filtering'; empty = BPA loss off (market1501
+                                 # has masks on disk, dukemtmc-reid does not, per progress.md)
+  masks_suffix: '.npy'
+
+loss:
+  id_weight: 1.0
+  triplet_weight: 1.0
+  triplet_margin: 0.3
+  align_weight: 0.5
+  align_visibility_threshold: 0.3   # only used when BPBreID's visibility scores are continuous
+  bpa_weight: 0.35                   # only used when data.masks_dir is set; bpbreid's own yaml default
+
+optim:
+  lr: 0.00035
+  weight_decay: 0.0005
+  epochs: 120
+  step_size: 40
+
+logging:
+  logs_dir: examples/logs/stage2_finetune
+  print_freq: 10
+  eval_step: 10
+  seed: 1
+
+# Consumed by Stage 5 (pcr/models/fusion_head.py), not by this script itself -- carried here so
+# the fusion mode intended for a checkpoint travels with the config that produced it.
+fusion:
+  mode: fixed_weights          # or learned_gate
+  w_global: 1.0
+  w_part: 0.5

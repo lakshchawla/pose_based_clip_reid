@@ -14,6 +14,16 @@ from torch.nn import functional as F
 DEFAULT_BATCH_SIZE = 1024
 
 
+def branch_visible_mask(visibility_column, threshold):
+    """visibility_column: [N] bool or float in [0, 1], one branch's visibility across a batch.
+    Bool visibility is used as-is (hard mask); continuous visibility is thresholded. Shared by
+    examples/train_prompts.py and examples/train_finetune.py -- previously duplicated verbatim
+    in both, moved here alongside this file's other visibility-gating conventions."""
+    if visibility_column.dtype == torch.bool:
+        return visibility_column
+    return visibility_column > threshold
+
+
 def replace_values(input, mask, value):
     return input * (~mask) + mask * value
 

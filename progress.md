@@ -860,3 +860,470 @@ real work automatically once run on 2+ GPUs; not a bug to fix now.
 training run (`-dt market1501`, `--backbone resnet50`, real masks, GiLt + BPA + VCL all active,
 2 epochs) completed clean, no NaN, no crash, checkpoint saved, visibility diagnostic printing
 correctly each epoch.
+
+### 2026-08-20 19:59 CST — New plan: add CLIP-ReID prompt learning, closing the gap to
+### `reid_pipeline_plan.md`; Stage 0 (environment + housekeeping) done
+
+**New plan, approved by the user, saved at
+`/home/lakshh/.claude/plans/in-this-repo-cleanly-refactored-river.md`.** `reid_pipeline_plan.md`
+(repo root) specifies BPBreID + CLIP-ReID (per-part prompt learning) + SPCL, three techniques in
+one pipeline. Research (three parallel Explore passes over this repo, `../bpbreid`, and
+`../CLIP-ReID`) confirmed the BPBreID+SPCL portions are already substantially built (see this
+file's history above) and grep-confirmed **zero** existing CLIP/prompt/text-encoder code anywhere
+in the repo. Gap to close, in order: (1) the entire CLIP-ReID component — net new; (2) a fusion
+module for single-descriptor retrieval — doesn't exist, matching always goes through
+`compute_bpb_pairwise_distance`'s per-part combination; (3) GiLt/BPA losses are wired into
+`train_usl.py` only, never carried into `train_uda.py` despite being planned for it in this file's
+2026-08-19 15:58 entry.
+
+**Deliberate deviation from `reid_pipeline_plan.md`'s own pseudocode**, grounded in reading
+CLIP-ReID's actual source (`../CLIP-ReID/processor/processor_clipreid_stage{1,2}.py`,
+`loss/supcontrast.py`, `model/make_model_clipreid.py`) rather than trusting the plan doc's
+simplified sketch: CLIP-ReID's real stage-1 loss is **not** plain diagonal InfoNCE — it's a
+multi-positive supervised-contrastive loss (`SupConLoss`, same-identity mask via
+`t_label==i_targets`, temperature fixed at 1.0, applied symmetrically i2t+t2i) computed over
+randomly-sampled sub-batches drawn from a precomputed full-dataset image-feature cache. Stage-2's
+"alignment" term is not a cosine-similarity regression either — it's label-smoothed cross-entropy
+of `image_features @ text_prototypes.T` against the real identity label, where `text_prototypes`
+is a frozen, precomputed-once (not per-step) per-identity lookup table built right before the
+epoch loop starts. This repo's new CLIP work will follow CLIP-ReID's verified real implementation,
+generalized to per-(identity,branch) instead of per-identity, over the plan document's simplified
+formulas.
+
+**Decided directly with the user** (via AskUserQuestion before finalizing the plan): the two new
+CLIP training scripts (`train_prompts.py`, `train_finetune.py`) get their own YAML configs, matching
+`reid_pipeline_plan.md`'s own skeleton — but the existing `train_uda.py`/`train_usl.py` **stay
+argparse-only**, unchanged, preserving this repo's established no-config-file convention for the
+scripts already built and verified that way. Execution proceeds one plan-stage at a time with a
+pause for review after each, not autonomously through all seven.
+
+**Stage 0 (environment + housekeeping) — done:**
+- `pip install ftfy regex git+https://github.com/openai/CLIP.git` into the `pcr2-run` conda env.
+  Verified directly, not just "installed cleanly": loaded `ViT-B/32` (auto-downloads and caches,
+  confirmed `text embed dim: torch.Size([49408, 512])`, `transformer width: 512`), tokenized and
+  encoded a sample string end-to-end, got a `[1, 512]` text feature — confirms the planned choice
+  (ViT-B/32's 512-dim text tower matches `BPBReIDModelCfg.dim_reduce_output=512` exactly, no
+  projection layer needed for the upcoming alignment losses).
+- **`pcr/utils/data/__init__.py::IterLoader.next()`** — fixed the unguarded double-`StopIteration`
+  crash at the source (previously only patched at one call site, in `train_usl.py`'s epoch-skip
+  guard, which stays as-is and is still the right place to *decide* to skip a degenerate epoch —
+  this fix is about `IterLoader` never crashing opaquely if some future caller doesn't replicate
+  that guard). Two changes, not one: (a) the retry now catches `StopIteration` specifically instead
+  of bare `Exception` — the old code would silently swallow and retry *any* exception on the first
+  `next()` call (a real worker crash, a corrupt image, a CUDA error), masking real bugs behind a
+  confusing "loader looked exhausted" retry; now only genuine exhaustion triggers the refill, and
+  any other exception propagates immediately and loudly. (b) a second consecutive `StopIteration`
+  (the loader is empty even on a fresh iterator) now raises a clear `RuntimeError` explaining why,
+  instead of letting a bare `StopIteration` escape `next()` — which is a real footgun beyond just
+  "ugly traceback": per PEP 479, an unguarded `StopIteration` propagating out of a function called
+  from inside a generator gets converted to a confusing `RuntimeError` by Python itself, or worse,
+  can silently terminate an unrelated enclosing `for`/`next()` loop if `next()` is ever called from
+  such a context in the future. Verified with three synthetic cases (normal wraparound still works
+  transparently; an empty loader raises the new clear `RuntimeError`; a real `ValueError` from a
+  broken iterator propagates immediately, unswallowed) — all three passed.
+- **`pcr/trainers.py`** — removed a stray, syntactically-inert triple-quoted string literal at the
+  bottom of the file (lines 105-116): a leftover, unexecuted copy of a prior planning prompt
+  ("implement loss functions required in this repository... Write a plan... Log the plan in
+  progress.md") that had been accidentally left in a shipped `.py` file. Pure deletion, no
+  behavior change.
+- Verified: `python -m py_compile` across every `.py` file in `pcr/` and `examples/` (not just the
+  touched files) — clean. `import pcr`, `from pcr.utils.data import IterLoader`, `from pcr.trainers
+  import PCRTrainer_UDA` all import correctly in `pcr2-run` after the edits.
+
+**Next**: Stage 1 (CLIP text branch + per-part prompt learner modules, no training loop yet) —
+paused here for review per the user's chosen execution cadence.
+
+### 2026-08-20 21:05 CST — Stage 1 done: CLIP text branch + per-part prompt learner (modules only)
+
+**New files:**
+- `pcr/models/clip_text_encoder.py::ClipTextEncoder(clip_arch='ViT-B/32', device='cuda')` — frozen
+  CLIP text tower, ported from `../CLIP-ReID/model/make_model_clipreid.py::TextEncoder` (lines
+  31-48). Keeps only `token_embedding`/`transformer`/`positional_embedding`/`ln_final`/
+  `text_projection` from the loaded `clip.load(clip_arch, device=device, jit=False)` model — CLIP's
+  own visual encoder is never built at all (BPBreID's backbone is the sole visual encoder
+  throughout this pipeline, per the plan's own framing). All params `requires_grad_(False)` +
+  `self.eval()` in the constructor. `forward(prompts, tokenized_prompts)` is a literal port of
+  CLIP-ReID's math (permute NLD/LND around the transformer, `ln_final`, gather the EOT-position
+  token via `tokenized_prompts.argmax(dim=-1)`, project). Confirmed `jit=False` + `device='cuda'`
+  loads the text tower in **fp16** (`clip.model.build_model`'s `convert_weights` runs before
+  `state_dict` load whenever `.float()` isn't explicitly called, which only happens on the
+  CPU-device path inside `clip.load`) — matches CLIP-ReID's own behavior exactly (they don't call
+  `.float()` after `.to('cuda')` either), not something this port introduced. `embed_dim=512`
+  confirmed via `text_projection.shape[1]`, matching `BPBReIDModelCfg.dim_reduce_output` exactly —
+  no projection layer needed anywhere in the upcoming alignment losses.
+- `pcr/models/prompt_learner.py::PartPromptLearner(num_identities, num_branches,
+  clip_text_encoder, n_ctx=4, device='cuda')` — generalizes CLIP-ReID's `PromptLearner` (same
+  file, lines 191-239) from per-identity to per-(identity, branch): `cls_ctx` shape
+  `[num_identities, num_branches, n_ctx, ctx_dim]` instead of `[num_identities, n_ctx, ctx_dim]`,
+  branch 0 = foreground (matching `BPBReIDEncoder.forward`'s own branch-0-is-foreground
+  convention), branches 1..K = the K learned parts. Same fixed template
+  (`"A photo of a X X X X person."`) and the same frozen prefix/suffix embedding-buffer splicing
+  mechanism as the original, shared across all identities and branches — only the `cls_ctx` slice
+  differs per (identity, branch). `forward(labels, branch_idx) -> [B, 77, ctx_dim]` for one branch
+  at a time (matches how the upcoming Stage-3 training loop iterates per-branch anyway). One
+  simplification over the original: collapsed CLIP-ReID's two separately-named-but-always-equal
+  variables (`n_ctx`, `n_cls_ctx`, both hardcoded to 4) into a single `n_ctx` — they must always
+  match for the prefix/suffix slice boundaries to line up, so keeping two names bought nothing.
+  Also: `tokenized_prompts`/`token_prefix`/`token_suffix` are registered as buffers (so they move
+  correctly with `.to(device)`/`.cuda()` on the parent module), rather than CLIP-ReID's own
+  hardcoded `.cuda()` call on `tokenized_prompts` and plain (non-buffer) attribute for the
+  prefix/suffix.
+
+**Verified, not just written** (synthetic tests, no training loop yet, matching this repo's
+established pre-wiring-verification discipline):
+- `ClipTextEncoder`: `embed_dim == 512`, every parameter `requires_grad is False`, constructed
+  module is in eval mode.
+- `PartPromptLearner`: `cls_ctx` shape exactly `[num_identities, num_branches, 4, 512]`;
+  prefix-length + suffix-length + 4 == 77 (full CLIP context length accounted for); two different
+  branches for the same identities produce different prompt embeddings (confirms per-branch
+  context actually varies); the same identity requested twice for the same branch produces
+  bit-identical prompts (confirms deterministic label-indexed lookup, no hidden randomness).
+- End-to-end: `ClipTextEncoder(PartPromptLearner(labels, branch), tokenized_prompts) -> [B, 512]`,
+  finite values.
+- **Gradient isolation, the most important check for this stage**: backprop from the text feature
+  output reaches `cls_ctx` (non-zero, finite gradient) and reaches **nothing** inside the frozen
+  `ClipTextEncoder` (`p.grad is None` for every one of its parameters after `.backward()`) — this
+  is the property Stage 3's training loop depends on (only the prompt learner trains; CLIP stays
+  frozen), verified directly rather than assumed from the `requires_grad_(False)` calls alone.
+- Full repo `python -m py_compile` sweep (`pcr/` + `examples/`) and `import pcr` +
+  both new modules — clean in `pcr2-run`.
+
+**Flagged for later, not acted on now**: `cls_ctx` is created in fp16 on GPU (inherits
+`clip_text_encoder.dtype`), matching CLIP-ReID's own original behavior exactly — Adam on fp16
+params can be numerically less stable than fp32 over many steps, but since this matches the
+verified-working reference implementation rather than deviating from it, no change is made
+preemptively. Worth watching during Stage 3's real smoke run (loss finite/no drift) before
+deciding whether to keep `cls_ctx` in fp32 and cast only when building prompts.
+
+**Next**: Stage 2 (CLIP alignment losses — `SupConLoss`, `I2TLoss`) — paused here for review.
+
+### 2026-08-20 21:15 CST — Stage 2 done: CLIP alignment losses (`SupConLoss`, `I2TLoss`)
+
+**New files:**
+- `pcr/loss/clip_supcon_loss.py::SupConLoss(temperature=1.0)` — ported faithfully from
+  `../CLIP-ReID/loss/supcontrast.py::SupConLoss`, confirmed by reading that file directly (not
+  from the earlier research summary alone). `forward(anchor_features, other_features,
+  anchor_labels, other_labels)`: identity-equality mask (`torch.eq(anchor_labels.unsqueeze(1),
+  other_labels.unsqueeze(0))`) — every same-identity pair across the two feature sets is a
+  positive, not only the same-index pair — normalized by `mask.sum(1)` per anchor, no
+  clamp/epsilon (matches the original, which relies on every anchor having >=1 positive by
+  construction whenever both label args come from the same batch; documented as the precondition
+  callers must preserve). Symmetric use (swap the two feature sets) gives CLIP-ReID's
+  `loss_i2t + loss_t2i`.
+- `pcr/loss/clip_i2t_loss.py::I2TLoss(num_identities, epsilon=0.1)` — ported from
+  `../CLIP-ReID/loss/make_loss.py`'s `I2TLOSS = xent(i2tscore, target)` branch. Confirms the
+  earlier research finding directly from source: this is **not** a cosine-similarity alignment
+  term, it's label-smoothed cross-entropy where the logits are `image_features @
+  text_prototypes.T` (dot product against a frozen per-identity prototype table) and the target
+  is the real identity label — the frozen table acts as a fixed linear classifier. Thin wrapper
+  around the existing `pcr/loss/crossentropy.py::CrossEntropyLabelSmooth`, reused exactly as
+  CLIP-ReID's own `make_loss.py` does, rather than reimplementing label smoothing a second time.
+
+**Verified against independent reference computations, not just re-run through the same code
+path** (this stage's most important check, since both losses' correctness hinges on subtle
+masking/normalization behavior that's easy to get silently wrong):
+- `SupConLoss`: cross-checked against a hand-written, non-vectorized per-anchor Python loop
+  (separate implementation of the same math, not a copy of the vectorized version) — matched to
+  `1e-5`. Separately confirmed the multi-positive mask **genuinely changes the result**: on the
+  same inputs, the real multi-positive loss (4.9617) differs from a diagonal-only-mask
+  (plain-InfoNCE-style) variant computed on the identical logits (6.7269) — proves by construction
+  that this is not accidentally equivalent to vanilla InfoNCE, not just asserted from reading the
+  formula. Gradient flow confirmed finite into both feature sets; symmetric (swapped-argument)
+  call also finite.
+- `I2TLoss`: cross-checked against an independently hand-written label-smoothed cross-entropy
+  computation (manual `log_softmax` + smoothed one-hot target, not calling
+  `CrossEntropyLabelSmooth` a second time) — matched to `1e-5`. Gradient isolation confirmed:
+  `image_features` receives a finite gradient, a `requires_grad=False` `text_prototypes` table
+  receives none — matches the intended usage (Stage 4 will pass Stage 3's frozen prototype table
+  here, never let gradient flow back into it).
+- Full repo `python -m py_compile` sweep and `import pcr` + both new loss modules — clean in
+  `pcr2-run`.
+
+**Next**: Stage 3 (`examples/train_prompts.py` + `configs/stage1_prompt_learning.yaml` — the
+Stage-1 training driver that actually wires `ClipTextEncoder`/`PartPromptLearner`/`SupConLoss`
+together into a runnable loop) — paused here for review.
+
+### 2026-08-20 22:25 CST — Stage 3 done: `examples/train_prompts.py` (Stage-1 training driver),
+### two real bugs found and fixed by actually running it
+
+**New files:**
+- `configs/stage1_prompt_learning.yaml` — the first YAML config in this repo, per the decision
+  made directly with the user before this plan started (new CLIP scripts get YAML, existing
+  `train_uda.py`/`train_usl.py` stay argparse-only). Sections: `model` (backbone/checkpoint/
+  dim_reduce_output/parts_num), `clip` (arch, n_ctx), `data` (dataset/data_dir/height/width/
+  batch_size/cache_batch_size/workers -- `data_dir` defaults to the real, confirmed-present
+  `/home/lakshh/workspace/reid/datasets`, not a placeholder), `optim` (lr/weight_decay/epochs/
+  warmup), `loss` (temperature, visibility_threshold), `logging`.
+- `pcr/utils/config.py::load_yaml_config` — minimal loader, dict -> dot-accessible
+  `ConfigNamespace`, used only by the two new CLIP scripts.
+- `pcr/utils/lr_scheduler.py::WarmupCosineLR` — added alongside the existing `WarmupMultiStepLR`
+  (ICE's, unchanged). Self-contained linear-warmup + cosine-decay, epoch-stepped, matching
+  CLIP-ReID's actual Stage-1 schedule (timm's `CosineLRScheduler`) without adding a timm
+  dependency for one schedule shape.
+- `examples/train_prompts.py::main_worker` — mirrors CLIP-ReID's `do_train_stage1`
+  (`../CLIP-ReID/processor/processor_clipreid_stage1.py`), generalized per-branch: (1) build a
+  frozen `BPBReIDEncoder` (ImageNet-init fallback when no checkpoint given, matching
+  `train_usl.py`'s convention) + frozen `ClipTextEncoder` + trainable `PartPromptLearner`; (2)
+  cache every training image's part-embeddings/visibility/real-label once under `no_grad`
+  (`cache_part_features`) -- no repeated encoder forward passes after this, matching the
+  reference's own full-dataset cache; (3) per epoch, draw random image-index sub-batches
+  (`torch.randperm`, not PK-sampled -- matches the reference's plain shuffled-index sampling, not
+  identity-balanced), and for every branch whose visibility mask has >=1 visible member in that
+  sub-batch, compute `SupConLoss` symmetrically (i2t + t2i) and sum across branches -- the
+  visibility-gating reid_pipeline_plan.md's own §3.1 pseudocode specifies, which CLIP-ReID's
+  original (single global branch, no visibility concept) doesn't need; (4) after training,
+  precompute the final frozen per-(identity,branch) text-prototype table once
+  (`compute_text_prototypes`, same precompute-once pattern CLIP-ReID's stage 2 uses) and save both
+  `prompt_learner.pth` and `text_prototypes.pth`.
+
+**Two real bugs found and fixed by actually running the training loop, not caught by
+`--setup-only` or synthetic tests** (same lesson this file's 2026-08-18 UDA entries already
+recorded: forward-only dry runs and `no_grad` passes cannot catch backward-pass-only failures):
+
+1. **PyYAML doesn't parse bare scientific notation (`1e-4`) as a float.** Confirmed directly
+   (`yaml.safe_load('1e-4')` -> the string `'1e-4'`, not a float; `yaml.safe_load('1.0e-4')` ->
+   `0.0001`, a float -- PyYAML/YAML-1.1 requires a decimal point in the mantissa). The first draft
+   of `configs/stage1_prompt_learning.yaml` used `3.5e-4`/`1e-4`/`1e-5`/`1e-6` for `lr`/
+   `weight_decay`/`warmup_lr_init`/`lr_min`; the latter three would have loaded as strings and
+   crashed `torch.optim.Adam(weight_decay=...)` the moment training actually started (not caught
+   by `--setup-only`, since that path never constructs the optimizer). Fixed by rewriting every
+   small value in the config as plain decimal notation (`0.0001`, `0.00001`, `0.000001`), which
+   PyYAML always parses correctly regardless of the scientific-notation mantissa-format quirk.
+2. **`torch.amp.GradScaler` hard-errors on an fp16 leaf parameter** ("Attempting to unscale FP16
+   gradients"), surfacing only at the first `scaler.step(optimizer)` call in real training (not at
+   `--setup-only`, which never calls `.backward()`/`.step()`). Root cause: `PartPromptLearner`
+   (Stage 1's own file, built two stages ago) created `cls_ctx` directly in
+   `clip_text_encoder.dtype` (fp16 on GPU) to match CLIP-ReID's original code exactly -- but
+   mixed-precision training requires fp32 master weights; an fp16 trainable parameter isn't a
+   pattern modern PyTorch's `GradScaler` supports, regardless of what CLIP-ReID's own (apparently
+   never actually run under this strict a check) code does. **Fixed in
+   `pcr/models/prompt_learner.py`**: `cls_ctx` is now created and stored in fp32 always, cast to
+   the frozen prefix/suffix buffers' dtype only inside `forward()` when assembling the prompt
+   embedding sequence -- standard fp32-master/fp16-compute practice; autograd handles the cast's
+   backward correctly (incoming gradient cast back to fp32 for accumulation into the fp32 leaf).
+   This resolves the "flagged for later, watch during Stage 3" note from Stage 1's own progress.md
+   entry -- conclusively, via a hard, unambiguous error rather than speculation. Re-verified all of
+   Stage 1's original synthetic tests still pass post-fix, plus a new direct check that
+   `scaler.step(optimizer)` succeeds (previously crashed with exactly this error).
+
+**Verified, in order:**
+1. Full repo `python -m py_compile` sweep -- clean, both before and after the two bug fixes.
+2. `--setup-only` dry run (`--backbone resnet50` for zero-setup, real Market1501 data at
+   `/home/lakshh/workspace/reid/datasets`): dataset loaded (751 train ids, 12,936 images), full-
+   dataset part-embedding cache built successfully (12,936 x 6 branches), `cls_ctx` shape
+   `(751, 6, 4, 512)` confirmed -- exited cleanly before the training loop as designed.
+3. Real smoke training run (2 epochs, `batch_size=32`, `print_freq=5`, random-init `resnet50`
+   backbone -- no source-pretrained BPBreID checkpoint exists yet, so this validates pipeline
+   mechanics only, same discipline as every prior dummy run in this file): completed in 3m19s, no
+   crash, no NaN at any point. **Loss visibly decreasing**, not just finite: epoch-0 average
+   41.2158, epoch-1 average 39.8853, with epoch 1's within-epoch trend clearly descending
+   (~40.7 at iter 5 -> ~39.0-39.4 by iter 400) -- a genuine, if early, learning signal, notable
+   since only `cls_ctx` is trainable here (everything else frozen) and the LR is still deep in its
+   5-epoch warmup (7.8e-05 of a 3.5e-4 base by epoch 1).
+4. Saved-file verification: `prompt_learner.pth` (`cls_ctx` shape `[751, 6, 4, 512]`, fp32) and
+   `text_prototypes.pth` (`text_prototypes` shape `[751, 6, 512]`, fp32, all-finite) both load
+   correctly and match the expected shapes/dtypes.
+5. Full repo `python -m py_compile` + `import pcr` sweep after all fixes landed -- clean in
+   `pcr2-run`.
+
+**Next**: Stage 4 (`examples/train_finetune.py` + `configs/stage2_backbone_finetune.yaml` + new
+`pcr/models/id_classifier.py::PartIdClassifiers` -- the Stage-2 supervised backbone-finetune
+driver that consumes this stage's `text_prototypes.pth`) -- paused here for review.
+
+### 2026-08-21 00:46 CST — Stage 4 done: `examples/train_finetune.py` (Stage-2 supervised
+### backbone-finetune driver), one more real bug found and fixed by testing the actual
+### cross-repo checkpoint hand-off
+
+**New files:**
+- `pcr/models/id_classifier.py::PartIdClassifiers(num_identities, embed_dim, branches=(0,))` --
+  persistent per-branch `nn.Linear` heads for the id loss, only built for branches actually
+  requested (default: foreground only, branch 0) -- matching bpbreid's own `default_losses_weights`
+  convention already documented in `pcr/loss/gilt_loss.py` (`foreg: id=1`, `parts: id=0`), and
+  deliberately avoiding the "wasted compute for gradient-dead heads" issue this file's 2026-08-18
+  audit entry flagged (and left unfixed) for BPBreID's own internal placeholder classifiers.
+- `configs/stage2_backbone_finetune.yaml` -- `model` (must match stage1's, notably
+  `checkpoint_path`, so stage 2 starts finetuning from the same point stage 1's prompts were
+  trained against), `stage1.prompt_dir` (only `text_prototypes.pth` is read from it), `data`
+  (dataset/batch/PK sampling/optional `masks_dir` for BPA loss), `loss` (id/triplet/align/bpa
+  weights), `optim`, `logging`, and a `fusion` section that's a pass-through placeholder for
+  Stage 5 (not consumed by this script).
+- `examples/train_finetune.py::main_worker` -- loads Stage 1's frozen `text_prototypes.pth`;
+  builds a fully-trainable `BPBReIDEncoder` (ImageNet-init fallback, same convention as
+  `train_usl.py`) + `PartIdClassifiers`; PK-sampled supervised loop (`RandomIdentitySampler`,
+  reused unchanged) combining four losses per iteration: id loss (foreground branch,
+  `CrossEntropyLabelSmooth` via `PartIdClassifiers`), triplet loss (all branches,
+  `PartTripletLoss`, visibility-gated internally), alignment loss (all branches, visibility-gated
+  per branch here since `I2TLoss` itself has no visibility concept, `I2TLoss` against Stage 1's
+  frozen prototypes), and optional BPA loss (masks-aware, off by default). Standard within-domain
+  supervised eval (`pcr/evaluators.py::Evaluator`, reused unchanged) every `eval_step` epochs.
+  Saves `encoder.model.state_dict()` specifically (the raw `BPBreID` model, not the
+  `BPBReIDEncoder` wrapper) -- the exact shape `torchreid.utils.load_pretrained_weights` expects,
+  so the resulting checkpoint is directly consumable by `train_uda.py`/`train_usl.py
+  --checkpoint-path` unchanged.
+
+**New preprocessor, added by refactoring rather than duplicating:**
+`pcr/utils/data/preprocessor.py` gained `PreprocessorMaskedSingleView` (one image + its mask +
+real `(pid, camid, index)` -- the shape Stage 2's supervised single-view training needs, unlike
+`PreprocessorMasked`'s two-view EMA-teacher-student shape from the USL path). Extracted two shared
+helpers first (`_load_raw_mask`, `_paired_geometric_transform`) so the existing, already-verified
+`PreprocessorMasked` (used by `train_usl.py`) and the new class both call the same geometric-
+pairing logic instead of forking it -- re-verified `PreprocessorMasked`'s exact behavior was
+unchanged after the refactor (see Verified section below) before trusting it as a foundation for
+the new class, not just assuming the refactor was safe. `pcr/loss/__init__.py` also gained
+`SupConLoss`/`I2TLoss` in its aggregated exports, for consistency with the package's other five
+losses (Stage 3's `train_prompts.py` already imports `SupConLoss` directly from its own submodule
+and was left unchanged, no reason to churn a working, verified import).
+
+**One more real bug, found by testing the actual cross-repo checkpoint hand-off (not by
+`--setup-only`, not by re-reading a saved file with this repo's own loader) -- `mean_ap()`
+(`pcr/evaluation_metrics/ranking.py`) returns `numpy.float64`, not a plain Python float.** Stage
+2's checkpoint stored this numpy scalar directly as `best_mAP`. `pcr.utils.serialization
+.load_checkpoint` (this repo's own loader, used by `train_finetune.py` itself to reload its own
+checkpoints) explicitly passes `weights_only=False` and loaded it fine -- **hiding** the problem.
+But the checkpoint's actual designed consumer is bpbreid's *own* `torchreid.utils
+.load_pretrained_weights` -> `torchtools.load_checkpoint`, which does **not** pass
+`weights_only=False`; on this environment's PyTorch 2.11 (default `weights_only=True` since
+2.6), that raised `UnpicklingError: ... GLOBAL numpy._core.multiarray.scalar was not an allowed
+global`, discovered only by actually round-tripping a real saved checkpoint through
+`BPBReIDEncoder(model_cfg, checkpoint_path=...)` -- the exact construction `train_uda.py`/
+`train_usl.py` do internally for `--checkpoint-path`. This is the same class of bug this file's
+prior entries keep surfacing: a forward-only or self-consistent-only test path cannot catch a
+failure that only appears when the *actual* downstream consumer (an external repo's loader, in
+this case) is exercised for real. **Fixed** in `train_finetune.py`: `mAP = float(evaluator
+.evaluate(...))` at the point of computation, so every place `mAP`/`best_mAP` flows from then on
+(comparison, checkpoint dict, print formatting) is a plain float. Scoped the fix to this file only
+-- `train_uda.py`'s own `best_mAP` has the identical numpy-scalar issue, but its checkpoint format
+was never part of the `--checkpoint-path` contract in the first place (it's a whole-DataParallel-
+wrapped-encoder state dict with different key prefixes, only ever reloaded via this repo's own
+`weights_only=False` loader) -- flagged here for awareness, not fixed as a drive-by outside this
+stage's actual scope.
+
+**Verified, in order:**
+1. Full repo `python -m py_compile` sweep after every file addition/refactor -- clean throughout.
+2. `PreprocessorMasked` (refactored) and the new `PreprocessorMaskedSingleView`, both tested
+   directly against the same real image+mask pair used in this file's 2026-08-19 16:58 entry
+   (`market1501/bounding_box_train/0002_c1s1_000451_03.jpg`): identical shapes to what was
+   verified back then (`img1 [3,384,128]`, `mask [6,384,128]`, mask sums to 1 per pixel) --
+   confirms the refactor didn't silently change `PreprocessorMasked`'s real behavior.
+3. `--setup-only` dry run (`--backbone resnet50`, real Market1501 data, Stage 3's own smoke-run
+   `text_prototypes.pth` as `stage1.prompt_dir`): dataset/prototype-table shape assertions passed,
+   encoder + id classifiers + loaders built cleanly, exited before training as designed.
+4. Real smoke training run, **unmasked path** (2 epochs, `batch_size=32`, real Market1501, random-
+   init resnet50 backbone): completed in 3m35s, no NaN/crash, all three active loss terms
+   (id/triplet/align) finite every logged iteration. **mAP 14.6% -> 21.3%/CMC top-1 38.2% across
+   just 2 epochs** -- markedly faster and higher than every prior UDA/USL dummy run in this file
+   (which topped out around 0.2-3.4% mAP on random-init backbones), consistent with Stage 2 having
+   real, static identity labels driving id+triplet loss directly rather than epoch-to-epoch DBSCAN
+   pseudo-labels -- exactly the kind of qualitative difference expected, not a red flag.
+5. Real smoke training run, **masked/BPA path** (same settings, `--masks-dir
+   pifpaf_maskrcnn_filtering`, exercising `forward_full`/`PreprocessorMaskedSingleView`/BPA loss
+   for the first time in this stage): completed in 3m37s, no NaN/crash, all four loss terms
+   (id/triplet/align/bpa) finite every iteration, mAP 13.6% -> 17.7%.
+6. **Checkpoint round-trip through the real consumer, not this repo's own loader** -- the most
+   important check for this stage's actual purpose (chaining into `train_uda.py`/`train_usl.py`):
+   built a *fresh* `BPBReIDEncoder(model_cfg, checkpoint_path='.../model_best.pth.tar')` via
+   bpbreid's own `torchreid.utils.load_pretrained_weights` (same call `--checkpoint-path` makes
+   internally) and compared every one of the 409 saved weight tensors against the fresh model's
+   loaded state **by exact tensor equality**, not shape-only or "no crash": all 409 matched
+   bit-for-bit, 0 missing, 0 mismatched, "Successfully loaded pretrained weights" with no
+   discarded-layers warning. First attempt hit the numpy-scalar `UnpicklingError` above; re-run
+   after the fix passed cleanly, `best_mAP` confirmed `<class 'float'>` in the reloaded checkpoint.
+7. Full repo `python -m py_compile` + `import pcr` sweep after all fixes landed -- clean in
+   `pcr2-run`.
+
+**Next**: Stage 5 (`pcr/models/fusion_head.py::FusionHead` -- fixed-weight and learned-gate
+single-descriptor fusion, per reid_pipeline_plan.md section 4) -- paused here for review.
+
+### 2026-08-21 01:33 CST — Stage 5 done: `pcr/models/fusion_head.py::FusionHead`
+
+**New file:**
+- `pcr/models/fusion_head.py::FusionHead(num_branches, embed_dim, mode='fixed_weights'|
+  'learned_gate', w_global=1.0, w_part=0.5, gate_hidden_dim=128)` -- reid_pipeline_plan.md
+  section 4's fusion module, adapted to this repo's actual encoder convention:
+  `BPBReIDEncoder.forward` returns one `[B, M, D]` tensor (branch 0 = foreground/global,
+  branches 1..K = parts) and one `[B, M]` visibility tensor, not the plan's separate
+  `global_feat`/`part_feats`/`visibility[K]` arguments -- same fusion math, indexed against
+  branch 0 instead of a trailing global slot. `forward(f_out, visibility) -> [B, M*D]`, always
+  L2-normalized.
+  - `'fixed_weights'`: global branch gets a fixed scalar weight, unaffected by visibility (matches
+    the plan's own `w_global_eff = w_global`, no gating); every part branch gets one shared scalar
+    weight, multiplied by that branch's visibility (bool or continuous) -- an invisible part
+    contributes exactly zero.
+  - `'learned_gate'`: a small 2-layer MLP maps `[global_feat, visibility]` to per-branch softmax
+    weights (global branch un-gated, part branches gated by visibility same as above) -- not wired
+    into any training script yet, per the approved plan's Stage 5 scope (module + verification
+    only).
+  - Purely additive: every existing training/eval script keeps using
+    `compute_bpb_pairwise_distance`'s part-distance matching unchanged; `FusionHead` only adds an
+    optional single-vector export path for ANN/FAISS-style retrieval, per the plan's own framing.
+
+**Verified, in order** (synthetic only, no training script wiring at this stage, matching the
+approved plan):
+1. `python -m py_compile` -- clean.
+2. `'fixed_weights'` mode: correct `[B, M*D]` shape, output L2-normalized (`norm ≈ 1`), and cross-
+   checked against an **independent, non-vectorized per-sample/per-branch Python-loop reference
+   computation** (not a copy of the vectorized formula) -- matched to `1e-5`.
+3. **Invisible-part zero-contribution, the most important property this module has to get right**:
+   corrupting an invisible branch's raw embedding with large random noise left the fused output
+   completely unchanged (`torch.allclose` at `1e-5`) -- proves the visibility gate genuinely zeroes
+   that branch's contribution, not just down-weights it. As a contrast check, corrupting a
+   *visible* branch's embedding **did** change the fused output, confirming the test isn't
+   vacuously true (e.g. from a bug that zeroes everything).
+4. `'learned_gate'` mode: correct shape, L2-normalized output, finite gradients into both the
+   input features and the gate's own parameters, the same invisible-part zero-contribution
+   property re-verified for this mode too, and confirmed the gate's weights genuinely respond to
+   different visibility patterns (all-visible vs. all-parts-invisible inputs produce different
+   softmax weights) -- not silently ignoring the visibility input.
+5. Continuous (non-boolean) visibility path: finite, correctly-shaped, L2-normalized output; and
+   confirmed the soft-gating behavior actually scales with the continuous value (0.1 vs. 0.9
+   visibility for the same branch produces different fused output), not merely thresholded to a
+   hard 0/1 internally.
+6. Invalid `mode` string raises `ValueError` with a clear message.
+7. Full repo `python -m py_compile` + `import pcr` sweep -- clean in `pcr2-run`.
+
+**Next**: Stage 6 (close the Stage-3/UDA GiLt+BPA gap -- port `PartGiLtLoss`/`BodyPartAttentionLoss`
+wiring into `pcr/trainers.py::PCRTrainer_UDA` and `examples/train_uda.py`, executing the plan
+already drafted in this file's 2026-08-19 15:58 entry for the UDA path specifically) -- paused
+here for review.
+
+### 2026-08-21 02:02 CST — Full-pipeline code review (Stages 0-5), three findings, all fixed
+
+Ran `/code-review high` against the complete working-tree diff (everything uncommitted since
+`be5b1eb`, i.e. all of Stages 0-5 together) per direct user request to review the pipeline built
+so far. Three findings, all real, all fixed:
+
+1. **Real crash risk (`examples/train_prompts.py`)**: `loss = b_features.new_zeros(())` at the
+   top of each training iteration is only ever reassigned inside the per-branch
+   `if visible.sum().item() < 1: continue` guard. If *every* branch (including foreground) has
+   zero visible samples in a given random 64-image sub-batch, `loss` stays the original grad-less
+   leaf zero tensor and `scaler.scale(loss).backward()` crashes with "element 0 of tensors does
+   not require grad and does not have a grad_fn". Plausible specifically because Stage 1's default
+   config uses `checkpoint_path: ''` (ImageNet init, no source-pretrained checkpoint) --
+   BPBreID's visibility head is untrained early on and can emit unreliable scores, unlike a
+   checkpoint where GiLt/attention training has already shaped it. **Fixed**: track
+   `any_branch_used` across the branch loop; skip the whole iteration (no backward/step) if it
+   stays `False`, mirroring the same "skip degenerate step rather than crash" pattern
+   `train_usl.py` already uses for its own (different) degenerate-epoch case.
+2. **Duplicated helper**: `branch_visible_mask` (bool-passthrough / continuous-threshold
+   visibility gating) was defined verbatim in both `examples/train_prompts.py` and
+   `examples/train_finetune.py` -- a fix to one could silently miss the other. **Fixed**: moved to
+   `pcr/utils/part_distance.py` (this repo's established home for visibility-gating conventions,
+   already holding `masked_mean`/`replace_values`), both scripts now import it from there.
+3. **Minor**: `assert proto['num_branches'] == num_branches` in `train_finetune.py` had no
+   message, unlike the identically-shaped `num_identities` assert right above it. **Fixed**: added
+   a matching descriptive message naming the actual mismatch (stage1 vs. stage2 `parts_num`).
+
+Review also explicitly verified (not just skipped) several things as **already correct**, worth
+recording so they aren't re-litigated: `PartPromptLearner`'s prefix/suffix token-slicing against
+CLIP's real tokenizer output ("A photo of a" -> exactly 5 tokens incl. SOT, matching `n_ctx+1`);
+`IterLoader`'s narrowed `except StopIteration` doesn't break `train_usl.py`'s existing epoch-skip
+guard; `Preprocessor`/`PreprocessorMaskedSingleView` tuple-unpacking in `train_finetune.py` lines
+up correctly; `BPBReIDEncoder.forward_full`/`Evaluator`/`PartTripletLoss`/
+`CrossEntropyLabelSmooth`/`BodyPartAttentionLoss` signatures all match their new call sites.
+
+**Verified after fixes**: full repo `python -m py_compile` sweep clean; re-ran both Stage 1 and
+Stage 2's real smoke training runs end-to-end on real Market1501 data -- Stage 1 produced
+**bit-identical** loss values to the pre-fix run (epoch 1 avg loss 39.8853, exactly matching,
+confirming the new guard is a true no-op on this data and the refactor changed nothing
+behaviorally), Stage 2 completed cleanly with mAP/CMC in the same range as before (21.1% mAP,
+38.5% top-1). No new bugs introduced by the fixes.

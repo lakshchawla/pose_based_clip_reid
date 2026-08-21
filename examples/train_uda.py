@@ -20,12 +20,14 @@ from pcr import datasets
 from pcr.models.bpbreid_encoder import BPBReIDEncoder, BPBReIDModelCfg
 from pcr.models.dsbn import convert_dsbn
 from pcr.models.hm import PartHybridMemory
+from pcr.models.id_classifier import PartIdClassifiers
+from pcr.loss import PartTripletLoss, CrossEntropyLabelSmooth, BodyPartAttentionLoss
 from pcr.trainers import PCRTrainer_UDA
 from pcr.evaluators import Evaluator, extract_features
 from pcr.utils.data import IterLoader
 from pcr.utils.data import transforms as T
 from pcr.utils.data.sampler import RandomMultipleGallerySampler
-from pcr.utils.data.preprocessor import Preprocessor
+from pcr.utils.data.preprocessor import Preprocessor, PreprocessorMaskedSingleView
 from pcr.utils.logging import Logger
 from pcr.utils.serialization import load_checkpoint, save_checkpoint
 from pcr.utils.jaccard_rerank import compute_jaccard_distance
@@ -41,28 +43,45 @@ def get_data(name, data_dir):
     return dataset
 
 
-def get_train_loader(args, dataset, height, width, batch_size, workers,
-                      num_instances, iters, trainset=None):
+def get_photometric_transform():
+    """Colour-only augmentation + tensor conversion -- used for the masks-aware source loader,
+    where PreprocessorMaskedSingleView already applies the geometric steps (resize/pad/crop/flip)
+    jointly to image and mask; matches examples/train_finetune.py's own
+    get_photometric_transform."""
     normalizer = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    train_transformer = T.Compose([
-        T.Resize((height, width), interpolation=3),
-        T.RandomHorizontalFlip(p=0.5),
-        T.Pad(10),
-        T.RandomCrop((height, width)),
+    return T.Compose([
         T.ToTensor(),
         normalizer,
-        T.RandomErasing(probability=0.5, mean=[0.485, 0.456, 0.406])
+        T.RandomErasing(probability=0.5, mean=[0.485, 0.456, 0.406]),
     ])
 
+
+def get_train_loader(args, dataset, height, width, batch_size, workers,
+                      num_instances, iters, trainset=None, masks_dir=None, masks_suffix='.npy'):
     train_set = sorted(dataset.train) if trainset is None else sorted(trainset)
     rmgs_flag = num_instances > 0
-    if rmgs_flag:
-        sampler = RandomMultipleGallerySampler(train_set, num_instances)
+    sampler = RandomMultipleGallerySampler(train_set, num_instances) if rmgs_flag else None
+
+    if masks_dir:
+        dataset_wrapper = PreprocessorMaskedSingleView(
+            train_set, masks_root=dataset.dataset_dir, masks_dir=masks_dir, height=height,
+            width=width, photometric_transform=get_photometric_transform(),
+            root=dataset.images_dir, mask_suffix=masks_suffix)
     else:
-        sampler = None
+        normalizer = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        train_transformer = T.Compose([
+            T.Resize((height, width), interpolation=3),
+            T.RandomHorizontalFlip(p=0.5),
+            T.Pad(10),
+            T.RandomCrop((height, width)),
+            T.ToTensor(),
+            normalizer,
+            T.RandomErasing(probability=0.5, mean=[0.485, 0.456, 0.406])
+        ])
+        dataset_wrapper = Preprocessor(train_set, root=dataset.images_dir, transform=train_transformer)
+
     train_loader = IterLoader(
-        DataLoader(Preprocessor(train_set, root=dataset.images_dir, transform=train_transformer),
-                   batch_size=batch_size, num_workers=workers, sampler=sampler,
+        DataLoader(dataset_wrapper, batch_size=batch_size, num_workers=workers, sampler=sampler,
                    shuffle=not rmgs_flag, pin_memory=True, drop_last=True), length=iters)
 
     return train_loader
@@ -128,7 +147,8 @@ def main_worker(args):
     dataset_target = get_data(args.dataset_target, args.data_dir)
     test_loader_target = get_test_loader(dataset_target, args.height, args.width, args.batch_size, args.workers)
     train_loader_source = get_train_loader(args, dataset_source, args.height, args.width,
-                                            args.batch_size, args.workers, args.num_instances, iters)
+                                            args.batch_size, args.workers, args.num_instances, iters,
+                                            masks_dir=args.masks_dir or None, masks_suffix=args.masks_suffix)
     source_classes = dataset_source.num_train_pids
 
     # Create model
@@ -178,21 +198,41 @@ def main_worker(args):
     # Evaluator
     evaluator = Evaluator(model)
 
+    # Optional GiLt (id + triplet) and BPA loss terms -- see pcr/trainers.py::PCRTrainer_UDA's
+    # own docstring for why id loss is source-only (real, static labels) while triplet loss
+    # applies to both source and target, and why BPA loss forces a different (single-GPU-only)
+    # forward path. use_gilt mirrors examples/train_usl.py's exact convention (either weight
+    # being positive turns the whole GiLt term on).
+    use_gilt = args.gilt_id_weight > 0 or args.gilt_triplet_weight > 0
+    id_classifiers = (PartIdClassifiers(source_classes, model.module.num_features, branches=(0,)).cuda()
+                       if use_gilt else None)
+    id_criterion = CrossEntropyLabelSmooth(source_classes).cuda() if use_gilt else None
+    triplet_criterion = PartTripletLoss(margin=args.gilt_triplet_margin).cuda() if use_gilt else None
+    bpa_criterion = BodyPartAttentionLoss().cuda() if args.masks_dir else None
+
     # Optimizer
     params = [{"params": [value]} for _, value in model.named_parameters() if value.requires_grad]
+    if id_classifiers is not None:
+        params += [{"params": [value]} for _, value in id_classifiers.named_parameters() if value.requires_grad]
     optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=0.1)
 
     indep_thres = None
 
     # Trainer
-    trainer = PCRTrainer_UDA(model, memory, source_classes)
+    trainer = PCRTrainer_UDA(model, memory, source_classes, id_classifiers=id_classifiers,
+                              id_criterion=id_criterion, triplet_criterion=triplet_criterion,
+                              id_weight=args.gilt_id_weight, triplet_weight=args.gilt_triplet_weight,
+                              bpa_criterion=bpa_criterion, bpa_weight=args.bpa_weight)
 
     if args.setup_only:
-        print('==> Setup complete: encoder ({} features, {} branches), memory {}x{}x{}, '
-              'optimizer/scheduler/trainer ready. Exiting before training loop (--setup-only).'
-              .format(model.module.num_features, model.module.num_parts,
-                      memory.features.size(0), memory.features.size(1), memory.features.size(2)))
+        print('==> Setup complete: encoder ({} features, {} branches), memory {}x{}x{}, GiLt {}, '
+              'BPA {}, optimizer/scheduler/trainer ready. Exiting before training loop '
+              '(--setup-only).'.format(
+                  model.module.num_features, model.module.num_parts,
+                  memory.features.size(0), memory.features.size(1), memory.features.size(2),
+                  'on' if use_gilt else 'off',
+                  'on ({})'.format(args.masks_dir) if args.masks_dir else 'off'))
         return
 
     for epoch in range(start_epoch, args.epochs):
@@ -365,6 +405,20 @@ if __name__ == '__main__':
                               "bpbreid's own torchreid/scripts/main.py) to load into the encoder")
     parser.add_argument('--backbone', type=str, default='hrnet32', choices=['hrnet32', 'resnet50'],
                          help="must match whatever backbone --checkpoint-path was pretrained with")
+    # GiLt (id + triplet) and BPA loss terms -- same flags/defaults as examples/train_usl.py,
+    # for consistency; see pcr/trainers.py::PCRTrainer_UDA's docstring for source/target scoping
+    parser.add_argument('--gilt-id-weight', type=float, default=1.0,
+                         help="source-only id loss weight (0 disables); either this or "
+                              "--gilt-triplet-weight being > 0 turns GiLt on")
+    parser.add_argument('--gilt-triplet-weight', type=float, default=1.0,
+                         help="source+target part-triplet loss weight (0 disables)")
+    parser.add_argument('--gilt-triplet-margin', type=float, default=0.3)
+    parser.add_argument('--masks-dir', type=str, default='',
+                         help="e.g. 'pifpaf_maskrcnn_filtering' -- enables BPA loss on the "
+                              "source domain only (masks are source-only on disk); empty = off")
+    parser.add_argument('--masks-suffix', type=str, default='.npy')
+    parser.add_argument('--bpa-weight', type=float, default=0.35,
+                         help="matches bpbreid's own yaml default; only used when --masks-dir is set")
     # optimizer
     parser.add_argument('--lr', type=float, default=0.00035, help="learning rate")
     parser.add_argument('--weight-decay', type=float, default=5e-4)

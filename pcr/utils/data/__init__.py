@@ -21,6 +21,16 @@ class IterLoader:
     def next(self):
         try:
             return next(self.iter)
-        except Exception:
+        except StopIteration:
             self.iter = iter(self.loader)
-            return next(self.iter)
+            try:
+                return next(self.iter)
+            except StopIteration:
+                raise RuntimeError(
+                    'IterLoader: underlying DataLoader yielded zero batches on a fresh '
+                    'iterator -- the dataset is smaller than one batch for the current '
+                    'batch_size/sampler/drop_last configuration. Callers that rebuild the '
+                    'dataset per-epoch (e.g. after pseudo-label clustering) should check '
+                    'the dataset size before calling next() rather than relying on this '
+                    'exception, since a bare second StopIteration here would otherwise '
+                    'propagate confusingly to whatever loop called next().')

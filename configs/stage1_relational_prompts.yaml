@@ -1,0 +1,63 @@
+# Stage 1: per-part CLIP prompt learning, with relational mixing across a person's K part
+# tokens on both sides -- TextRelationBlock (owned by PromptLearner) on the text side,
+# VisualRelationBlock on the image side. BPBreID backbone and the CLIP text encoder are both
+# frozen; PromptLearner (incl. TextRelationBlock) and VisualRelationBlock train. See
+# examples/train_relational_prompts.py. Run examples/cache_text_anchors.py against this same
+# config afterward to build Stage 2's frozen text-prototype table.
+#
+# Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the trb:/vrb:/
+# visibility: sections below are the new content relative to that file.
+
+model:
+  backbone: hrnet32          # or resnet50 -- must match --checkpoint-path if one is given
+  checkpoint_path: ''        # optional external bpbreid checkpoint; empty = ImageNet init
+  dim_reduce_output: 512     # must equal clip.arch's text embed dim (512 for ViT-B/32 and ViT-B/16)
+  parts_num: 5                # K body parts; num_branches = 1 (foreground) + parts_num
+
+clip:
+  arch: ViT-B/32
+  n_ctx: 4                    # learnable context tokens per (identity, branch)
+
+trb:
+  num_heads: 4                 # TextRelationBlock's attention heads, over the K part branches
+  num_layers: 1                # start shallow -- see progress.md for the ablation this should feed
+
+vrb:
+  num_heads: 4                 # VisualRelationBlock's attention heads, over the K part branches
+  num_layers: 1                # start shallow -- see progress.md for the ablation this should feed
+
+visibility:
+  # upstream candidate-acceptance gate (reid_pipeline_plan.md's part-relational-attention
+  # addendum, section 0.1): images whose mean part-visibility falls below this are rejected
+  # before caching/training ever sees them -- see pcr/utils/visibility_filter.py for the exact
+  # definition. 0.0 effectively disables filtering (every image passes).
+  lambda_v_min: 0.5
+
+data:
+  dataset: market1501         # or dukemtmc-reid
+  data_dir: /home/lakshh/workspace/reid/datasets
+  height: 384
+  width: 128
+  batch_size: 64               # random image sub-batch size per SupCon training step
+  cache_batch_size: 64         # batch size for the one-off full-dataset feature-caching pass
+  workers: 4
+
+optim:
+  # PyYAML (YAML 1.1) requires a decimal point in the mantissa for scientific notation to parse
+  # as a float -- confirmed directly: yaml.safe_load('1e-4') -> the string '1e-4', not a float,
+  # which would crash torch.optim.Adam(weight_decay=...). Plain decimal notation always parses
+  # correctly, so small values below are written that way rather than as scientific notation.
+  lr: 0.00035
+  weight_decay: 0.0001
+  epochs: 120
+  warmup_epochs: 5
+  warmup_lr_init: 0.00001
+  lr_min: 0.000001
+
+loss:
+  temperature: 1.0
+
+logging:
+  logs_dir: examples/logs/stage1_prompts
+  print_freq: 10
+  seed: 1

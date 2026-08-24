@@ -156,7 +156,7 @@ class PreprocessorMasked(Dataset):
 
 class PreprocessorMaskedSingleView(Dataset):
     """Like PreprocessorMasked, but for supervised single-view training (examples/
-    train_finetune.py): no second augmented view, no EMA-teacher pairing -- just one image + its
+    train_relational_finetune.py): no second augmented view, no EMA-teacher pairing -- just one image + its
     mask + the real (pid, camid, index) the supervised id/triplet/alignment losses need. Shares
     the geometric-pairing helper with PreprocessorMasked rather than duplicating it."""
 

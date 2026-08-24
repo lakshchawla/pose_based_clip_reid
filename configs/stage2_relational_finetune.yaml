@@ -1,6 +1,11 @@
 # Stage 2: supervised backbone finetune. BPBreID backbone + attention are trainable; Stage 1's
 # prompts/CLIP text encoder are frozen (Stage 1's frozen text-prototype table is loaded from
-# stage1.prompt_dir, not recomputed here). See examples/train_finetune.py.
+# stage1.prompt_dir, not recomputed here). VisualRelationBlock is *not* frozen -- it continues
+# training here, starting from Stage 1's weights (also read from stage1.prompt_dir). See
+# examples/train_relational_finetune.py.
+#
+# Renamed from stage2_backbone_finetune.yaml -- pairs with the renamed script; the vrb:/
+# visibility: sections below are the new content relative to that file.
 
 model:
   backbone: hrnet32          # must match stage1's model.backbone -- see stage1.prompt_dir note below
@@ -11,9 +16,19 @@ model:
   parts_num: 5
 
 stage1:
-  # directory produced by examples/train_prompts.py -- only text_prototypes.pth is read here
-  # (prompt_learner.pth itself isn't needed, its whole job was producing that frozen table)
+  # directory produced by examples/train_relational_prompts.py + examples/cache_text_anchors.py --
+  # reads text_prototypes.pth (the frozen alignment target) and vrb.pth (VisualRelationBlock's
+  # Stage-1-trained starting weights, which this stage continues training) from here
   prompt_dir: examples/logs/stage1_prompts
+
+vrb:
+  num_heads: 4                 # must match stage1's vrb.num_heads/num_layers -- these define the
+  num_layers: 1                # architecture vrb.pth's weights were trained for
+
+visibility:
+  # same upstream candidate-acceptance gate as Stage 1 (pcr/utils/visibility_filter.py), applied
+  # to this stage's own training set before the first epoch
+  lambda_v_min: 0.5
 
 data:
   dataset: market1501         # or dukemtmc-reid
@@ -32,7 +47,6 @@ loss:
   triplet_weight: 1.0
   triplet_margin: 0.3
   align_weight: 0.5
-  align_visibility_threshold: 0.3   # only used when BPBreID's visibility scores are continuous
   bpa_weight: 0.35                   # only used when data.masks_dir is set; bpbreid's own yaml default
 
 optim:

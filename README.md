@@ -10,6 +10,10 @@ PCR combines three techniques into one pipeline, per `reid_pipeline_plan.md`:
 3. **SPCL**'s self-paced hybrid-memory strategy (Jaccard/k-reciprocal re-ranking -> DBSCAN ->
    self-paced reliability filtering -> contrastive memory-bank loss -> DSBN) for unsupervised
    domain adaptation, or an ICE-style single-domain unsupervised alternative.
+4. **Part-relational attention** -- bidirectional self-attention across a person's K body-part
+   tokens, on both the visual side (VisualRelationBlock) and the text side (TextRelationBlock),
+   in Stage 1/2 only (Stage 3 is untouched by this). See `pcr/models/relation_blocks.py` and
+   `progress.md` for the design.
 
 Repo layout mirrors SpCL's own shape (`examples/` + a `pcr/` package with `models/`, `loss/`,
 `utils/`, `datasets/`, `evaluation_metrics/`), not BPBReID/torchreid's. Every hyperparameter for
@@ -28,35 +32,56 @@ pip install ftfy regex git+https://github.com/openai/CLIP.git   # frozen CLIP te
 ## Pipeline stages
 
 ```
-Stage 1 (train_prompts.py)  -->  Stage 2 (train_finetune.py)  -->  Stage 3 (train_uda.py or train_usl.py)
-per-part CLIP prompt            supervised backbone finetune         domain adaptation (UDA) or
-learning, backbone frozen       + CLIP alignment loss                single-domain unsupervised (USL)
+Stage 1                cache_text_anchors.py    Stage 2                    Stage 3
+(train_relational        (build Stage 2's       (train_relational          (train_uda.py or
+ _prompts.py)              alignment target)     _finetune.py)              train_usl.py)
+per-part CLIP prompt   -->                   --> supervised backbone   --> domain adaptation
++ relation blocks,                               finetune + CLIP           (UDA) or single-
+backbone frozen                                  alignment + VRB           domain unsupervised
 ```
 
 Run the whole thing with `examples/run_pipeline.py`, or any subset of stages directly.
 
-### Stage 1 -- per-part CLIP prompt learning
+### Stage 1 -- per-part CLIP prompt learning + relational attention
 
 ```bash
-python examples/train_prompts.py --config configs/stage1_prompt_learning.yaml
+python examples/train_relational_prompts.py --config configs/stage1_relational_prompts.yaml
 ```
 
 Frozen BPBreID encoder (ImageNet-init by default, or set `model.checkpoint_path` to an
-externally-pretrained BPBreID checkpoint) + frozen CLIP text encoder; only a per-(identity,
-branch) learnable prompt context trains. Produces `prompt_learner.pth` and `text_prototypes.pth`
-(a frozen per-identity, per-branch text-embedding lookup table) under `logging.logs_dir`.
+externally-pretrained BPBreID checkpoint) + frozen CLIP text encoder. Trainable: `PromptLearner`
+(per-(identity, branch) learnable prompt context, owning a `TextRelationBlock` that mixes the K
+part branches' context together before any part's prompt is built) and a `VisualRelationBlock`
+(mixes the K part branches' pooled visual features the same way). The training set is filtered
+first by a visibility-index threshold (`visibility.lambda_v_min`) -- see
+`pcr/utils/visibility_filter.py`. Produces `prompt_learner.pth` and `vrb.pth` under
+`logging.logs_dir`.
+
+```bash
+python examples/cache_text_anchors.py --config configs/stage1_relational_prompts.yaml
+```
+
+Run once, after Stage 1 finishes, against the *same* config. Loads `prompt_learner.pth` and
+builds `text_prototypes.pth` (a frozen per-identity, per-branch text-embedding lookup table) --
+the only one of Stage 1's outputs Stage 2 actually reads.
 
 ### Stage 2 -- supervised backbone finetune
 
 ```bash
-python examples/train_finetune.py --config configs/stage2_backbone_finetune.yaml
+python examples/train_relational_finetune.py --config configs/stage2_relational_finetune.yaml
 ```
 
-Set `stage1.prompt_dir` in the config to Stage 1's `logging.logs_dir`. Trains the full BPBreID
-encoder with real identity labels: id loss + triplet loss + an alignment loss against Stage 1's
-frozen text prototypes, plus an optional BPA (body-part-attention) loss if `data.masks_dir` is
-set (masks are source-domain-only on disk for Market1501; DukeMTMC-reID has none). Produces a
-checkpoint directly loadable by Stage 3's `--checkpoint-path`, unchanged.
+Set `stage1.prompt_dir` in the config to Stage 1's `logging.logs_dir` (this is where both
+`text_prototypes.pth` and `vrb.pth` are read from). Trains the full BPBreID encoder with real
+identity labels: id loss (foreground branch only) + triplet loss + an alignment loss against
+Stage 1's frozen text prototypes, plus an optional BPA (body-part-attention) loss if
+`data.masks_dir` is set (masks are source-domain-only on disk for Market1501; DukeMTMC-reID has
+none). `VisualRelationBlock` continues training here (loaded from Stage 1's `vrb.pth`, jointly
+with the now-unfrozen backbone) -- unlike `PromptLearner`/`TextRelationBlock`, which are frozen
+and discarded after Stage 1. No per-branch visibility gating inside the loss loop here; the same
+`visibility.lambda_v_min` filter Stage 1 uses is applied to this stage's own training set instead.
+Produces a checkpoint directly loadable by Stage 3's `--checkpoint-path`, unchanged (Stage 3 is
+untouched by VisualRelationBlock -- its own weights save separately and aren't consumed yet).
 
 ### Stage 3 -- domain adaptation
 
@@ -94,18 +119,19 @@ since its pseudo-label numbering changes every epoch).
 
 ```bash
 python examples/run_pipeline.py \
-    --stage1-config configs/stage1_prompt_learning.yaml \
-    --stage2-config configs/stage2_backbone_finetune.yaml \
+    --stage1-config configs/stage1_relational_prompts.yaml \
+    --stage2-config configs/stage2_relational_finetune.yaml \
     --stage3 uda \
     -ds dukemtmc-reid -dt market1501 --data-dir /path/to/datasets --logs-dir logs/full_run
 ```
 
-Runs the selected stages in order, stopping on the first failure. Any argument this script
-doesn't recognize (like `-ds`/`-dt`/`--data-dir`/`--logs-dir` above) is passed straight through to
-the Stage 3 script; `--checkpoint-path`/`--backbone` are auto-filled from Stage 2's checkpoint and
-config unless already given explicitly. Omit `--stage1-config`/`--stage2-config` to skip those
-stages (e.g. to run Stage 3 alone against an externally-pretrained checkpoint); pass
-`--stage3 none` to stop after Stage 2.
+Runs the selected stages in order (Stage 1 automatically triggers `cache_text_anchors.py`
+afterward, against the same `--stage1-config`), stopping on the first failure. Any argument this
+script doesn't recognize (like `-ds`/`-dt`/`--data-dir`/`--logs-dir` above) is passed straight
+through to the Stage 3 script; `--checkpoint-path`/`--backbone` are auto-filled from Stage 2's
+checkpoint and config unless already given explicitly. Omit `--stage1-config`/`--stage2-config`
+to skip those stages (e.g. to run Stage 3 alone against an externally-pretrained checkpoint);
+pass `--stage3 none` to stop after Stage 2.
 
 ### Alternative: external BPBreID source pretraining
 

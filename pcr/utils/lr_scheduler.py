@@ -1,5 +1,5 @@
 """WarmupMultiStepLR ported near-verbatim from ice/utils/lr_scheduler.py. WarmupCosineLR is new,
-added for examples/train_prompts.py -- a self-contained, epoch-stepped linear-warmup + cosine-
+added for examples/train_relational_prompts.py -- a self-contained, epoch-stepped linear-warmup + cosine-
 decay schedule matching CLIP-ReID's actual Stage-1 schedule (timm's CosineLRScheduler, called via
 `scheduler.step(epoch)`), without adding a timm dependency for one schedule shape.
 """

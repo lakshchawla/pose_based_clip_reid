@@ -1,26 +1,49 @@
 """Stage 2: supervised backbone finetune. BPBreID backbone + attention are trainable; Stage 1's
 learned prompts and the CLIP text encoder are both frozen -- only Stage 1's precomputed
-text_prototypes.pth (a frozen per-(identity,branch) lookup table) is used here, as the alignment
-loss's fixed target. Combines four losses, matching reid_pipeline_plan.md section 3.2 generalized
-per-branch and CLIP-ReID's actual stage-2 formula (loss/make_loss.py) for the alignment term:
+text_prototypes.pth (a frozen per-(identity,branch) lookup table, built by
+examples/cache_text_anchors.py) is used here, as the alignment loss's fixed target.
+VisualRelationBlock, by contrast, is *not* frozen: it was trainable in Stage 1 too (with the
+backbone frozen there), and this script loads its Stage-1 weights (vrb.pth) as a starting point
+and keeps training it jointly with the now-unfrozen backbone -- it is a permanent part of the
+visual pipeline, not training-only scaffolding the way PromptLearner/TextRelationBlock are.
+
+Combines four losses, matching reid_pipeline_plan.md section 3.2 generalized per-branch and
+CLIP-ReID's actual stage-2 formula (loss/make_loss.py) for the alignment term:
 
   - id loss (foreground branch only, matching bpbreid's own default_losses_weights convention
     already documented in pcr/loss/gilt_loss.py): CrossEntropyLabelSmooth via a persistent
     PartIdClassifiers head (real, static labels here -- not per-epoch cluster centers, unlike the
-    USL path, since Stage 2 has real identity labels throughout).
-  - triplet loss (all branches): pcr/loss/part_triplet_loss.py::PartTripletLoss, visibility-gated
-    internally.
-  - alignment loss (all branches, visibility-gated per branch): pcr/loss/clip_i2t_loss.py::I2TLoss
-    against Stage 1's frozen per-branch text prototypes.
+    USL path, since Stage 2 has real identity labels throughout). Foreground is untouched by
+    VisualRelationBlock (see pcr/models/relation_blocks.py), so this term is unchanged from
+    before this file gained VRB.
+  - triplet loss (all branches -- foreground plus VRB-mixed parts): pcr/loss/part_triplet_loss.py
+    ::PartTripletLoss.
+  - alignment loss (all branches): pcr/loss/clip_i2t_loss.py::I2TLoss against Stage 1's frozen
+    per-branch text prototypes.
   - BPA loss (optional, source-domain masks only): pcr/loss/body_part_attention_loss.py, off by
-    default (data.masks_dir empty in the YAML).
+    default (data.masks_dir empty in the YAML). Operates on pixels_cls_scores (a spatial map),
+    entirely separate from the pooled features VRB touches -- unaffected by this file's changes.
+
+Scope note, an explicit decision logged in progress.md, not a default slipped in quietly: no
+per-branch visibility gating in the triplet or alignment loss loops -- every branch contributes
+for every sample, unconditionally, matching reid_pipeline_plan.md's part-relational-attention
+addendum (section 0.1). Reliability is handled once, upstream, by the same visibility filter
+Stage 1 uses (pcr/utils/visibility_filter.py), applied to this stage's own training set before
+the first epoch.
+
+Renamed from train_finetune.py -- paired with train_relational_prompts.py's rename, since this
+file changed substantively too (VRB, dropped visibility gating, the upstream filter), unlike a
+plain rename with no functional change.
 
 Produces a checkpoint of just the BPBreID model's own state dict (not the whole encoder wrapper),
 directly loadable by the existing examples/train_uda.py --checkpoint-path or
-examples/train_usl.py --checkpoint-path unchanged.
+examples/train_usl.py --checkpoint-path unchanged -- Stage 3 stays completely out of this file's
+scope, VisualRelationBlock's own weights are saved separately and nothing downstream reads them
+yet.
 
-Config-driven (YAML) -- see configs/stage2_backbone_finetune.yaml. Same deliberate deviation from
-the rest of pcr2 as examples/train_prompts.py (train_uda.py/train_usl.py stay argparse-only).
+Config-driven (YAML) -- see configs/stage2_relational_finetune.yaml. Same deliberate deviation
+from the rest of pcr2 as examples/train_relational_prompts.py (train_uda.py/train_usl.py stay
+argparse-only).
 """
 from __future__ import print_function, absolute_import
 import argparse
@@ -38,6 +61,7 @@ from torch.utils.data import DataLoader
 from pcr import datasets
 from pcr.models.bpbreid_encoder import BPBReIDEncoder, BPBReIDModelCfg
 from pcr.models.id_classifier import PartIdClassifiers
+from pcr.models.relation_blocks import VisualRelationBlock
 from pcr.loss import PartTripletLoss, CrossEntropyLabelSmooth, I2TLoss, BodyPartAttentionLoss
 from pcr.evaluators import Evaluator
 from pcr.utils.config import load_yaml_config
@@ -47,8 +71,8 @@ from pcr.utils.data.sampler import RandomIdentitySampler
 from pcr.utils.data.preprocessor import Preprocessor, PreprocessorMaskedSingleView
 from pcr.utils.logging import Logger
 from pcr.utils.osutils import mkdir_if_missing
-from pcr.utils.part_distance import branch_visible_mask
 from pcr.utils.serialization import save_checkpoint, load_checkpoint
+from pcr.utils.visibility_filter import filter_by_visibility
 
 
 def get_data(name, data_dir):
@@ -78,8 +102,7 @@ def get_unmasked_transform(height, width):
     ])
 
 
-def get_train_loader(dataset, cfg):
-    train_set = sorted(dataset.train)
+def get_train_loader(dataset, cfg, train_set):
     sampler = RandomIdentitySampler(train_set, cfg.data.num_instances)
     if cfg.data.masks_dir:
         dataset_wrapper = PreprocessorMaskedSingleView(
@@ -123,7 +146,7 @@ def mask_to_pixel_targets(mask, pixels_cls_scores):
     return mask.argmax(dim=1)
 
 
-def compute_losses(encoder, id_classifiers, triplet_loss, id_loss, align_loss, bpa_loss,
+def compute_losses(encoder, vrb, id_classifiers, triplet_loss, id_loss, align_loss, bpa_loss,
                     text_prototypes, imgs, mask, targets, cfg):
     use_masks = bpa_loss is not None
     if use_masks:
@@ -132,30 +155,36 @@ def compute_losses(encoder, id_classifiers, triplet_loss, id_loss, align_loss, b
         f_out, vis = encoder(imgs)
         pixels_cls_scores = None
 
+    # VisualRelationBlock mixes the K part branches only; foreground (branch 0) passes through
+    # untouched, then the two are recombined into one [B, 1+K, D] tensor so the rest of this
+    # function (triplet/align losses) can keep treating "all branches" uniformly, same as before
+    # VRB existed.
+    relation_parts = vrb(f_out[:, 1:, :])  # [B, K, D]
+    combined = torch.cat([f_out[:, 0:1, :], relation_parts], dim=1)  # [B, 1+K, D]
+
     total = f_out.new_zeros(())
     log = {}
 
-    id_logits = id_classifiers(f_out, 0)
+    id_logits = id_classifiers(combined, 0)
     l_id = id_loss(id_logits, targets)
     total = total + cfg.loss.id_weight * l_id
     log['id'] = l_id.item()
 
-    result = triplet_loss(f_out, targets, parts_visibility=vis)
+    # no parts_visibility argument -- every branch contributes for every sample unconditionally,
+    # per reid_pipeline_plan.md's part-relational-attention addendum section 0.1; reliability is
+    # handled once, upstream, by the visibility filter applied to the training set before this
+    # loop ever runs, not by masking individual (sample, branch) pairs here
+    result = triplet_loss(combined, targets)
     if result is not None:
         l_tri = result[0]
         total = total + cfg.loss.triplet_weight * l_tri
         log['triplet'] = l_tri.item()
 
-    num_branches = f_out.size(1)
+    num_branches = combined.size(1)
     align_total = f_out.new_zeros(())
     for branch in range(num_branches):
-        visible = branch_visible_mask(vis[:, branch], cfg.loss.align_visibility_threshold)
-        if visible.sum().item() < 1:
-            continue
-        branch_feats = f_out[visible, branch, :]
-        branch_targets = targets[visible]
         branch_prototypes = text_prototypes[:, branch, :]
-        align_total = align_total + align_loss(branch_feats, branch_prototypes, branch_targets)
+        align_total = align_total + align_loss(combined[:, branch, :], branch_prototypes, targets)
     total = total + cfg.loss.align_weight * align_total
     log['align'] = align_total.item()
 
@@ -209,23 +238,39 @@ def main_worker(cfg, setup_only=False):
     encoder = build_encoder(cfg)
     id_classifiers = PartIdClassifiers(num_identities, cfg.model.dim_reduce_output, branches=(0,)).cuda()
 
+    vrb = VisualRelationBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.vrb.num_heads,
+                               num_layers=cfg.vrb.num_layers).cuda()
+    vrb_path = osp.join(cfg.stage1.prompt_dir, 'vrb.pth')
+    vrb.load_state_dict(load_checkpoint(vrb_path))
+    print('==> Loaded Stage 1 VisualRelationBlock weights from {}'.format(vrb_path))
+
     triplet_loss = PartTripletLoss(margin=cfg.loss.triplet_margin).cuda()
     id_loss = CrossEntropyLabelSmooth(num_identities).cuda()
     align_loss = I2TLoss(num_identities).cuda()
     use_masks = bool(cfg.data.masks_dir)
     bpa_loss = BodyPartAttentionLoss().cuda() if use_masks else None
 
-    train_loader = get_train_loader(dataset, cfg)
+    print("==> Filtering training set by visibility index (threshold={})".format(
+        cfg.visibility.lambda_v_min))
+    encoder.eval()
+    filtered_train_set, _ = filter_by_visibility(
+        sorted(dataset.train), encoder, cfg.data.height, cfg.data.width,
+        cfg.visibility.lambda_v_min, root=dataset.images_dir, batch_size=cfg.data.batch_size,
+        workers=cfg.data.workers)
+    encoder.train()
+
+    train_loader = get_train_loader(dataset, cfg, filtered_train_set)
     test_loader = get_test_loader(dataset, cfg.data.height, cfg.data.width, cfg.data.batch_size,
                                    cfg.data.workers)
 
     if setup_only:
-        print('==> Setup complete: {} identities, {} branches, masks {}. Exiting before the '
-              'training loop (--setup-only).'.format(
-                  num_identities, num_branches, 'ON (' + cfg.data.masks_dir + ')' if use_masks else 'off'))
+        print('==> Setup complete: {} identities, {} branches, {} images after visibility '
+              'filtering, masks {}. Exiting before the training loop (--setup-only).'.format(
+                  num_identities, num_branches, len(filtered_train_set),
+                  'ON (' + cfg.data.masks_dir + ')' if use_masks else 'off'))
         return
 
-    params = list(encoder.parameters()) + list(id_classifiers.parameters())
+    params = list(encoder.parameters()) + list(id_classifiers.parameters()) + list(vrb.parameters())
     optimizer = torch.optim.Adam(params, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg.optim.step_size, gamma=0.1)
     evaluator = Evaluator(encoder)
@@ -233,6 +278,7 @@ def main_worker(cfg, setup_only=False):
     best_mAP = 0
     for epoch in range(cfg.optim.epochs):
         encoder.train()
+        vrb.train()
         train_loader.new_epoch()
         train_iters = len(train_loader)
 
@@ -248,14 +294,14 @@ def main_worker(cfg, setup_only=False):
             targets = targets.cuda()
 
             optimizer.zero_grad()
-            loss, log = compute_losses(encoder, id_classifiers, triplet_loss, id_loss, align_loss,
-                                        bpa_loss, text_prototypes, imgs, mask, targets, cfg)
+            loss, log = compute_losses(encoder, vrb, id_classifiers, triplet_loss, id_loss,
+                                        align_loss, bpa_loss, text_prototypes, imgs, mask, targets, cfg)
             loss.backward()
             optimizer.step()
 
             if (it + 1) % cfg.logging.print_freq == 0:
-                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\t{}'.format(
-                    epoch, it + 1, train_iters, loss.item(),
+                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\tVRB gate {:.3f}\t{}'.format(
+                    epoch, it + 1, train_iters, loss.item(), torch.tanh(vrb.gate).item(),
                     '\t'.join('{} {:.3f}'.format(k, v) for k, v in log.items())))
 
         lr_scheduler.step()
@@ -282,6 +328,11 @@ def main_worker(cfg, setup_only=False):
             }, is_best, fpath=osp.join(cfg.logging.logs_dir, 'checkpoint.pth.tar'))
             print('\n * Finished epoch {:3d}  model mAP: {:5.1%}  best: {:5.1%}{}\n'.format(
                 epoch, mAP, best_mAP, ' *' if is_best else ''))
+
+    torch.save(vrb.state_dict(), osp.join(cfg.logging.logs_dir, 'vrb.pth'))
+    print('==> Saved Stage-2-trained VisualRelationBlock weights to {} (not consumed by anything '
+          'downstream yet -- Stage 3 is out of scope for this change)'.format(
+              osp.join(cfg.logging.logs_dir, 'vrb.pth')))
 
     print('==> Test with the best model:')
     best_fpath = osp.join(cfg.logging.logs_dir, 'model_best.pth.tar')

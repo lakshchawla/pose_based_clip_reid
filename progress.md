@@ -1488,3 +1488,118 @@ Stage 2's real smoke training runs end-to-end on real Market1501 data -- Stage 1
 confirming the new guard is a true no-op on this data and the refactor changed nothing
 behaviorally), Stage 2 completed cleanly with mAP/CMC in the same range as before (21.1% mAP,
 38.5% top-1). No new bugs introduced by the fixes.
+
+---
+
+### 2026-08-24 00:00 — Part-Relational Attention: bidirectional cross-part mixing added to both
+### Stage 1 and Stage 2, on top of the CLIP-ReID prompt-learning pipeline closed out above
+
+New user-supplied plan ("Part-Relational Attention for BPBreID + CLIP-ReID"): BPBreID's K pooled
+part embeddings and CLIP-ReID's per-part learnable prompt contexts are each produced completely
+independently of one another (no term anywhere lets "left arm" and "torso" influence each other's
+embedding, or one part's prompt context inform another's). The plan adds one bidirectional
+self-attention block per side to close that gap, confined to Stage 1/2 (Stage 3 --
+`train_uda.py`/`train_usl.py` -- explicitly out of scope, left untouched). Three design questions
+were resolved directly with the user before implementation: build inside pcr2's actual flat
+`pcr/models/`+`pcr/loss/`+`examples/`+`configs/` layout (not the plan's own aspirational
+`engine/`/`losses/`/`scripts/`/`data/` tree); keep K=5 (not the plan's K=8, which was justified by
+an occlusion-specific reason this design explicitly puts out of scope, and would break the
+already-produced Stage 2 checkpoint on the training server); Stage 3 stays completely untouched.
+
+**New module -- `pcr/models/relation_blocks.py`**: `VisualRelationBlock` (one `nn.TransformerEncoder`
+layer, bidirectional, over the K pooled part vectors, wrapped in a learned zero-initialized
+residual gate -- `part_tokens + tanh(gate) * encoder(part_tokens)` -- so it starts as a no-op and
+only learns to mix if useful; permanent at inference, trained in both Stage 1 and Stage 2) and
+`TextRelationBlock` (same shape of block, no gate/residual, over a person's K*n_ctx learnable
+part-context tokens, run *before* any part's prompt is spliced together -- training-only, owned
+internally by `PromptLearner`, discarded after Stage 1 once its output is baked into the cached
+text-prototype table). Neither block does any masking internally -- see the upstream-filtering
+paragraph below for why.
+
+**Rewritten -- `pcr/models/prompt_learner.py`**: `PartPromptLearner` renamed to `PromptLearner`,
+API redesigned around two separate learnable context tensors (`fg_ctx` for the foreground branch,
+untouched by any relation block; `part_ctx` for the K part branches, mixed through
+`TextRelationBlock` internally) and a single `build_part_prompts(labels)` call that returns all
+`1+K` branches' spliced prompt tensors at once, replacing the old one-branch-at-a-time
+`forward(labels, branch_idx)`.
+
+**New -- `pcr/utils/visibility_filter.py`**: implements the plan's section-0.1 assumption that
+occlusion handling is out of scope and images are pre-filtered upstream by a visibility-index
+threshold (`lambda_v_min`), so neither relation block nor either stage's losses need any
+per-sample, per-branch masking. `filter_by_visibility(dataset_list, encoder, ...)` runs the frozen
+encoder once under `no_grad`, computes each image's mean part-visibility (excluding foreground),
+and keeps only images at or above the threshold -- applied once, before Stage 1's feature cache
+and before Stage 2's training loader are built, replacing the old per-loss-term
+`branch_visible_mask`/skip-if-invisible pattern entirely (every admitted image's every branch now
+contributes unconditionally to every loss term).
+
+**Renamed + rewritten -- `examples/train_prompts.py` -> `examples/train_relational_prompts.py`**
+(Stage 1 driver): builds `PromptLearner` + `VisualRelationBlock`, runs `filter_by_visibility` on
+the training set before caching visual features, then per iteration builds all `1+K` prompts via
+one `build_part_prompts()` call, mixes the cached part features through `VisualRelationBlock`, and
+sums symmetric SupCon loss over every branch (no visibility-based skipping). Saves
+`prompt_learner.pth` (whole `PromptLearner` state, TRB included) and `vrb.pth`; no longer saves
+`text_prototypes.pth` itself.
+
+**New -- `examples/cache_text_anchors.py`**: standalone script, run once after Stage 1 against the
+same config. Loads `prompt_learner.pth`, calls `build_part_prompts()` per identity-batch, saves
+`text_prototypes.pth`. Split out from Stage 1 per the plan's own rationale: this is a deterministic,
+frozen forward pass that shouldn't be recomputed on every Stage-2 training step.
+
+**Renamed + rewritten -- `examples/train_finetune.py` -> `examples/train_relational_finetune.py`**
+(Stage 2 driver): loads `vrb.pth` from `stage1.prompt_dir` and keeps `VisualRelationBlock`
+trainable (jointly with the now-unfrozen backbone); `compute_losses()` now mixes the K part
+embeddings through VRB before id/triplet/align losses see them, drops the `parts_visibility=`
+argument to `PartTripletLoss` (now a plain unweighted per-branch average, since the upstream filter
+already guarantees full visibility) and the per-branch visibility skip in the align-loss loop
+(every branch always contributes). `filter_by_visibility` applied to this stage's own training set
+too, before the loader is built. Re-saves `vrb.pth` at the end (Stage 2's continued-training VRB
+weights -- not consumed by anything downstream yet, since Stage 3 is out of scope for this change).
+
+**Renamed configs**: `configs/stage1_prompt_learning.yaml` -> `configs/stage1_relational_prompts.yaml`
+(added `trb:`/`vrb:`/`visibility:` sections, removed the now-unused `loss.visibility_threshold`);
+`configs/stage2_backbone_finetune.yaml` -> `configs/stage2_relational_finetune.yaml` (added
+`vrb:`/`visibility:` sections, removed `loss.align_visibility_threshold`).
+
+**`examples/run_pipeline.py`**: `STAGE_SCRIPTS` updated to the renamed Stage 1/2 scripts plus a new
+`cache_anchors` entry; the Stage 1 block now runs `cache_text_anchors.py` automatically right after
+`train_relational_prompts.py`, against the same `--stage1-config`.
+
+**`README.md`**: pipeline-stage diagram, Stage 1/2 sections, and the orchestrator example rewritten
+to match the renamed scripts/configs and the new VRB/TRB/`cache_text_anchors.py`/visibility-filter
+pieces.
+
+**`METHODOLOGY.md`**: Stage 1 (section 3) and Stage 2 (section 4) rewritten throughout -- prompt
+construction now describes the `fg_ctx`/`part_ctx` split and where `TextRelationBlock` sits in the
+pipeline; the SupCon and alignment loss formulas drop their per-branch visibility threshold in
+favor of the upstream filter; the part-triplet distance formula drops its visibility-weighted
+average in favor of a plain average (Stage 1/2 only -- Stage 3's own visibility-weighted version in
+section 5 is untouched); both algorithm pseudocode blocks updated to match. Section 3.5 ("Design
+Note: Attention Maps Never Reach the Text Encoder") rewritten to explain what `VisualRelationBlock`/
+`TextRelationBlock` add without crossing that image/text boundary, replacing the stale description
+of the old single-branch `PartPromptLearner.forward(labels, branch_idx)` API with the actual
+`PromptLearner.build_part_prompts(labels)` code path, plus a new 3.5.2 subsection on the upstream
+visibility filter that replaced per-branch masking.
+
+**Stale-reference cleanup**: fixed leftover `train_prompts.py`/`train_finetune.py`/
+`PartPromptLearner` mentions in docstrings across `pcr/utils/config.py`, `pcr/utils/lr_scheduler.py`,
+`pcr/models/clip_text_encoder.py`, `pcr/utils/data/preprocessor.py`, `examples/train_uda.py`,
+`pcr/models/relation_blocks.py`, `pcr/models/id_classifier.py`. Removed
+`pcr/utils/part_distance.py::branch_visible_mask` entirely -- confirmed by repo-wide grep to be
+unused now that both Stage 1 and Stage 2 dropped per-branch visibility gating in favor of the
+upstream filter.
+
+**Note on process**: an earlier attempt at this same plan (TRB only, VRB explicitly deferred) was
+built first per an initial round of clarifying-question answers, then reverted via `git checkout
+HEAD -- <files>` back to the last commit (`102b6fe`) after the user clarified that both VRB and TRB
+must ship together -- the revert also unintentionally discarded an uncommitted, unrelated earlier
+edit to `METHODOLOGY.md` section 3.5 (added in response to a prior "why don't attention maps reach
+the text encoder" question, never committed), since git cannot selectively revert one uncommitted
+edit to a file from another. That section has been restored and updated above; nothing else from
+that unrelated edit was lost.
+
+**Verification status**: every new/changed file individually `python -m py_compile`-checked, plus a
+full repo-wide `py_compile` sweep (`pcr/`, `examples/`) -- all clean. No synthetic shape/gradient
+tests or real training smoke runs have been performed for this change -- the `pcr2-run` conda env's
+`torch` installation was found broken mid-session (unrelated to this change) and has not yet been
+repaired, so runtime verification remains blocked pending that fix.

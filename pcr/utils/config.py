@@ -1,5 +1,5 @@
-"""Minimal YAML config loader, used only by the CLIP training stages (examples/train_prompts.py,
-examples/train_finetune.py) -- the rest of pcr2 stays argparse-only, per this repo's established
+"""Minimal YAML config loader, used only by the CLIP training stages (examples/train_relational_prompts.py,
+examples/train_relational_finetune.py) -- the rest of pcr2 stays argparse-only, per this repo's established
 convention (see progress.md). Exposes the loaded config via dot-access (cfg.model.backbone)
 rather than nested dict indexing, since these two scripts read many nested fields.
 """

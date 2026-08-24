@@ -46,7 +46,7 @@ def get_data(name, data_dir):
 def get_photometric_transform():
     """Colour-only augmentation + tensor conversion -- used for the masks-aware source loader,
     where PreprocessorMaskedSingleView already applies the geometric steps (resize/pad/crop/flip)
-    jointly to image and mask; matches examples/train_finetune.py's own
+    jointly to image and mask; matches examples/train_relational_finetune.py's own
     get_photometric_transform."""
     normalizer = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     return T.Compose([

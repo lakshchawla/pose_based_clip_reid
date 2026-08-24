@@ -35,7 +35,7 @@ class ClipTextEncoder(nn.Module):
         self.eval()
 
     def forward(self, prompts, tokenized_prompts):
-        """prompts: [B, 77, ctx_dim] assembled prompt embeddings (from PartPromptLearner -- NOT
+        """prompts: [B, 77, ctx_dim] assembled prompt embeddings (from PromptLearner -- NOT
         raw token ids, the embedding lookup already happened). tokenized_prompts: [1, 77] integer
         token ids from the shared template, used only to locate each sequence's EOT position via
         argmax (EOT has the highest token id in CLIP's vocabulary); broadcasts against the batch

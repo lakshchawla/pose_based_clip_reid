@@ -1,5 +1,5 @@
 """Persistent per-branch nn.Linear identity classifiers for Stage 2's supervised id loss
-(examples/train_finetune.py). Unlike pcr/loss/gilt_loss.py::PartGiLtLoss (which classifies
+(examples/train_relational_finetune.py). Unlike pcr/loss/gilt_loss.py::PartGiLtLoss (which classifies
 against per-epoch DBSCAN cluster centers, since USL's pseudo-label count/numbering changes every
 epoch), Stage 2 trains on real, static identity labels -- a persistent parametric classifier head
 is the right fit here, matching bpbreid's own original GiLt design (which pcr2's DBSCAN-cluster

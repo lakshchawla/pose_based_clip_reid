@@ -3,4 +3,23 @@ Name: pcr
 Version: 0.1.0
 Summary: PCR: BPBReID part-based feature pooling trained under SpCL self-paced UDA
 Author: 
+Requires-Dist: ftfy
+Requires-Dist: regex
+Requires-Dist: numpy
+Requires-Dist: Cython
+Requires-Dist: h5py
+Requires-Dist: Pillow
+Requires-Dist: six
+Requires-Dist: scipy
+Requires-Dist: opencv-python
+Requires-Dist: matplotlib
+Requires-Dist: future
+Requires-Dist: yacs
+Requires-Dist: gdown
+Requires-Dist: albumentations
+Requires-Dist: pandas
+Requires-Dist: tabulate
+Requires-Dist: deepdiff
+Requires-Dist: pyyaml
+Dynamic: requires-dist
 Dynamic: summary

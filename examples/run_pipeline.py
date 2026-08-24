@@ -1,19 +1,20 @@
-"""Thin sequential orchestrator: Stage 1 (prompt learning) -> Stage 2 (backbone finetune) ->
-Stage 3 (UDA or USL domain adaptation, user-selected) -> eval, per reid_pipeline_plan.md section
-6. Each stage script already evaluates internally at the end of its own run (via
-pcr/evaluators.py::Evaluator), so no separate eval step exists here -- "eval" in the plan's own
-section 6 is what Stage 3 already does.
+"""Thin sequential orchestrator: Stage 1 (prompt learning) -> cache_text_anchors (build Stage 2's
+frozen alignment target from Stage 1's checkpoint) -> Stage 2 (backbone finetune) -> Stage 3 (UDA
+or USL domain adaptation, user-selected) -> eval, per reid_pipeline_plan.md section 6. Each stage
+script already evaluates internally at the end of its own run (via pcr/evaluators.py::Evaluator),
+so no separate eval step exists here -- "eval" in the plan's own section 6 is what Stage 3
+already does.
 
 Shells out to each stage's own script as a separate process rather than importing them as library
-functions -- train_prompts.py/train_finetune.py/train_uda.py/train_usl.py are all
-`if __name__ == '__main__':`-driven scripts with process-global state (stdout redirection via
-Logger, CUDA context, argparse), never designed to be called twice in one Python process. This
-file's only real job: run the selected stages in order, stop on the first failure, and compute
-the one piece of information that crosses the YAML/argparse boundary between Stage 2 and Stage 3
--- the checkpoint path Stage 2 wrote, which Stage 3's --checkpoint-path needs. Everything else is
-passed straight through to whichever scripts run; Stage 1 -> Stage 2 wiring needs no such help
-since it's already config-file-driven (stage2's own YAML names the stage1 output directory it
-reads from directly).
+functions -- train_relational_prompts.py/cache_text_anchors.py/train_relational_finetune.py/
+train_uda.py/train_usl.py are all `if __name__ == '__main__':`-driven scripts with process-global
+state (stdout redirection via Logger, CUDA context, argparse), never designed to be called twice
+in one Python process. This file's only real job: run the selected stages in order, stop on the
+first failure, and compute the one piece of information that crosses the YAML/argparse boundary
+between Stage 2 and Stage 3 -- the checkpoint path Stage 2 wrote, which Stage 3's
+--checkpoint-path needs. Everything else is passed straight through to whichever scripts run;
+Stage 1 -> cache_text_anchors -> Stage 2 wiring needs no such help since it's already
+config-file-driven (all three read/write the same stage1 logs_dir).
 """
 from __future__ import print_function, absolute_import
 import argparse
@@ -26,8 +27,9 @@ import yaml
 
 EXAMPLES_DIR = osp.dirname(osp.abspath(__file__))
 STAGE_SCRIPTS = {
-    'prompts': osp.join(EXAMPLES_DIR, 'train_prompts.py'),
-    'finetune': osp.join(EXAMPLES_DIR, 'train_finetune.py'),
+    'prompts': osp.join(EXAMPLES_DIR, 'train_relational_prompts.py'),
+    'cache_anchors': osp.join(EXAMPLES_DIR, 'cache_text_anchors.py'),
+    'finetune': osp.join(EXAMPLES_DIR, 'train_relational_finetune.py'),
     'uda': osp.join(EXAMPLES_DIR, 'train_uda.py'),
     'usl': osp.join(EXAMPLES_DIR, 'train_usl.py'),
 }
@@ -61,10 +63,11 @@ def main():
                     "does not strip it, and the Stage 3 script's own parser -- with no positional "
                     "arguments of its own -- rejects a literal '--' as an unrecognized argument.")
     parser.add_argument('--stage1-config', type=str, default=None, metavar='PATH',
-                         help="configs/stage1_prompt_learning.yaml-style path; omit to skip "
-                              "Stage 1 (e.g. prompt learning was already run separately)")
+                         help="configs/stage1_relational_prompts.yaml-style path; omit to skip "
+                              "Stage 1 and cache_text_anchors.py (e.g. prompt learning was "
+                              "already run separately)")
     parser.add_argument('--stage2-config', type=str, default=None, metavar='PATH',
-                         help="configs/stage2_backbone_finetune.yaml-style path; omit to skip Stage 2")
+                         help="configs/stage2_relational_finetune.yaml-style path; omit to skip Stage 2")
     parser.add_argument('--stage3', type=str, choices=['uda', 'usl', 'none'], default='none',
                          help="which Stage-3 domain-adaptation driver to run after Stage 1/2, "
                               "or 'none' to stop after Stage 2's checkpoint")
@@ -83,8 +86,9 @@ def main():
 
     if args.stage1_config:
         run([args.python, STAGE_SCRIPTS['prompts'], '--config', args.stage1_config])
+        run([args.python, STAGE_SCRIPTS['cache_anchors'], '--config', args.stage1_config])
     else:
-        print('==> Skipping Stage 1 (no --stage1-config given)')
+        print('==> Skipping Stage 1 and cache_text_anchors.py (no --stage1-config given)')
 
     stage2_checkpoint = stage2_backbone = None
     if args.stage2_config:

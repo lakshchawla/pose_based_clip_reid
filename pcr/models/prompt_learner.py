@@ -1,34 +1,47 @@
-"""Per-(identity, body-part-branch) generalization of CLIP-ReID's PromptLearner
-(../CLIP-ReID/model/make_model_clipreid.py, lines 191-239). One learnable context-vector sequence
-per (identity, branch) pair -- branch 0 = foreground (matches BPBReIDEncoder.forward's convention,
-pcr/models/bpbreid_encoder.py), branches 1..K = the K learned body parts -- sharing one fixed
-template ("a photo of a X X X X person.") and one frozen prefix/suffix embedding buffer across all
-identities and branches, per reid_pipeline_plan.md section 3.1's prompt_i_k design.
+"""Per-identity, per-body-part prompt learning, generalized from CLIP-ReID's PromptLearner
+(../CLIP-ReID/model/make_model_clipreid.py, lines 191-239), with a relational-mixing step
+(TextRelationBlock, pcr/models/relation_blocks.py) across the K part branches' context tokens
+before any part's prompt is assembled -- see progress.md's entry on this change for why.
 
-n_ctx serves two purposes that CLIP-ReID's original code keeps as two separately-named variables
-(n_ctx, n_cls_ctx) always set to the same literal 4: the number of "X" placeholder tokens in the
-fixed template (which determines where the frozen prefix ends and suffix begins), and the length
-of the learnable context spliced into their place. One name here instead of two, since they must
-always be equal for the prefix/suffix slicing to line up and splitting them buys nothing.
-
-Deviation from CLIP-ReID's original, found by actually running the training loop (Stage 3's real
-smoke run), not by inspection: CLIP-ReID creates cls_ctx directly in clip_model.dtype (fp16 on
-GPU). `torch.amp.GradScaler.step()` hard-errors ("Attempting to unscale FP16 gradients") on an
-fp16 leaf parameter -- mixed-precision training requires fp32 master weights, an fp16 trainable
-parameter isn't the supported pattern regardless of what CLIP-ReID's own (evidently never run
-under a GradScaler this strict) code does. Fixed here: cls_ctx is created and stored in fp32
-always, cast to the frozen buffers' dtype only inside forward() when assembling the prompt
-embedding -- standard fp32-master/fp16-compute practice, and autograd handles the cast's backward
-correctly (the incoming gradient is cast back to fp32 for accumulation into the fp32 parameter).
+Branch 0 (foreground, matching BPBreIDEncoder.forward's own convention) stays completely outside
+the relational-mixing step: it keeps its own independent learnable context, exactly as before
+this file gained a TextRelationBlock. Branches 1..K (the K parts) share one flat context sequence
+that TextRelationBlock mixes together, then this class slices back into K per-part 4-token
+blocks. See pcr/models/relation_blocks.py's own module docstring for why foreground is excluded
+(the source plan frames it as an optional addition, not the base case).
 """
 import clip
 import torch
 import torch.nn as nn
 
+from .relation_blocks import TextRelationBlock
 
-class PartPromptLearner(nn.Module):
-    def __init__(self, num_identities, num_branches, clip_text_encoder, n_ctx=4, device='cuda'):
-        super(PartPromptLearner, self).__init__()
+
+class PromptLearner(nn.Module):
+    """n_ctx serves two purposes that CLIP-ReID's original code keeps as two separately-named
+    variables (n_ctx, n_cls_ctx) always set to the same literal 4: the number of "X" placeholder
+    tokens in the fixed template (which determines where the frozen prefix ends and suffix
+    begins), and the length of the learnable context spliced into their place. One name here
+    instead of two, since they must always be equal for the prefix/suffix slicing to line up.
+
+    Two separate learnable context tensors, not one: `fg_ctx` (foreground, [num_identities,
+    n_ctx, ctx_dim], never touched by TextRelationBlock) and `part_ctx` (the K parts, flat as
+    [num_identities, K*n_ctx, ctx_dim] so TextRelationBlock can attend across all of them at
+    once -- a transformer layer needs its input as one sequence, not K separate blocks).
+
+    Deviation from CLIP-ReID's original, found by actually running the training loop (back when
+    this repo still only had UDA/USL, long before this file existed): CLIP-ReID creates its
+    context directly in clip_model.dtype (fp16 on GPU). `torch.amp.GradScaler.step()` hard-errors
+    ("Attempting to unscale FP16 gradients") on an fp16 leaf parameter -- mixed-precision
+    training requires fp32 master weights. Fixed here: both context tensors are fp32 always, cast
+    to the frozen buffers' dtype only inside build_part_prompts() when assembling each prompt --
+    autograd handles the cast's backward correctly (the incoming gradient is cast back to fp32
+    for accumulation into the fp32 parameter).
+    """
+
+    def __init__(self, num_identities, num_parts, clip_text_encoder, n_ctx=4,
+                 trb_num_heads=4, trb_num_layers=1, device='cuda'):
+        super(PromptLearner, self).__init__()
         ctx_dim = clip_text_encoder.embed_dim
         dtype = clip_text_encoder.dtype
 
@@ -37,11 +50,17 @@ class PartPromptLearner(nn.Module):
         with torch.no_grad():
             embedding = clip_text_encoder.token_embedding(tokenized_prompts).type(dtype)
 
-        # fp32 master weights, cast to the frozen buffers' dtype only in forward() -- see the
-        # module docstring for why (GradScaler forbids fp16 leaf parameters)
-        cls_vectors = torch.empty(num_identities, num_branches, n_ctx, ctx_dim, dtype=torch.float32)
-        nn.init.normal_(cls_vectors, std=0.02)
-        self.cls_ctx = nn.Parameter(cls_vectors)
+        # fp32 master weights, cast to the frozen buffers' dtype only in build_part_prompts() --
+        # see the class docstring for why (GradScaler forbids fp16 leaf parameters)
+        fg_vectors = torch.empty(num_identities, n_ctx, ctx_dim, dtype=torch.float32)
+        nn.init.normal_(fg_vectors, std=0.02)
+        self.fg_ctx = nn.Parameter(fg_vectors)
+
+        part_vectors = torch.empty(num_identities, num_parts * n_ctx, ctx_dim, dtype=torch.float32)
+        nn.init.normal_(part_vectors, std=0.02)
+        self.part_ctx = nn.Parameter(part_vectors)
+
+        self.trb = TextRelationBlock(ctx_dim, num_heads=trb_num_heads, num_layers=trb_num_layers)
         self.prompt_dtype = dtype
 
         # not trained, but must move with the module (.cuda()/.to()) -- registered as buffers
@@ -51,15 +70,30 @@ class PartPromptLearner(nn.Module):
         self.register_buffer('token_suffix', embedding[:, n_ctx + 1 + n_ctx:, :])
 
         self.num_identities = num_identities
-        self.num_branches = num_branches
+        self.num_parts = num_parts
+        self.num_branches = 1 + num_parts
         self.n_ctx = n_ctx
 
-    def forward(self, labels, branch_idx):
-        """labels: [B] identity indices. branch_idx: int in [0, num_branches). Returns
-        [B, 77, ctx_dim] assembled prompt embeddings for that one branch, splicing the
-        per-(identity,branch) learnable context between the frozen prefix/suffix."""
-        cls_ctx = self.cls_ctx[labels, branch_idx].type(self.prompt_dtype)  # [B, n_ctx, ctx_dim]
-        b = labels.shape[0]
+    def _splice(self, ctx):
+        """ctx: [B, n_ctx, ctx_dim], already dtype-cast. Returns [B, 77, ctx_dim]: frozen prefix
+        + ctx + frozen suffix."""
+        b = ctx.size(0)
         prefix = self.token_prefix.expand(b, -1, -1)
         suffix = self.token_suffix.expand(b, -1, -1)
-        return torch.cat([prefix, cls_ctx, suffix], dim=1)
+        return torch.cat([prefix, ctx, suffix], dim=1)
+
+    def build_part_prompts(self, labels):
+        """labels: [B] identity indices. Returns a list of `num_branches` tensors, each
+        [B, 77, ctx_dim] -- index 0 is the foreground prompt (built from the unmixed fg_ctx),
+        indices 1..K are the K part prompts (built from part_ctx after one shared
+        TextRelationBlock pass mixes all K parts' context together, then sliced back apart)."""
+        fg = self._splice(self.fg_ctx[labels].type(self.prompt_dtype))
+
+        raw_part_ctx = self.part_ctx[labels].type(self.prompt_dtype)  # [B, K*n_ctx, ctx_dim]
+        mixed_part_ctx = self.trb(raw_part_ctx)
+        parts = []
+        for k in range(self.num_parts):
+            start = k * self.n_ctx
+            parts.append(self._splice(mixed_part_ctx[:, start:start + self.n_ctx, :]))
+
+        return [fg] + parts

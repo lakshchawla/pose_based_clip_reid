@@ -1631,3 +1631,73 @@ Full repo `python -m py_compile` sweep clean after the rename. Not re-run: the S
 `--setup-only` smoke check (already verified working under the old names earlier today, in
 `pcr2-run`) -- the rename touched no logic, only names, so it wasn't re-run, but should be if
 there's any doubt.
+
+---
+
+### 2026-08-26 02:25 — Stage 0 added: BPA segmentation pretraining, closing a real gap in
+### body-part semantic grounding
+
+Motivating question, raised directly: does CLIP's text encoder ever actually "see" body parts,
+and is BPA (BPBreID's pixel-to-part classifier) trained by anything that ties a specific branch
+index to a specific real anatomical region? Investigated both, concretely:
+
+1. **Stage 1's prompts use learned placeholder tokens, not real body-part words.**
+   `pcr/models/prompt_learner.py`'s template is `"A photo of a X X X X person."` -- the context
+   tokens are fully learned vectors, never literal words like "legs" or "torso". CLIP's frozen
+   text encoder is never told what part a branch represents; it only ever supplies a fixed
+   high-dimensional target space for identity-level alignment, not part semantics.
+2. **BPA does receive gradient in Stage 2, but only an identity-discrimination signal.** Traced
+   the actual autograd graph in `third_party/torchreid/models/bpbreid.py`: `pixels_cls_scores =
+   self.pixel_classifier(spatial_features)` feeds directly into `parts_masks` -> `parts_embeddings`
+   in one differentiable path, so with the backbone unfrozen (Stage 2), id/triplet/align losses
+   all backprop into the pixel classifier. But nothing in that signal says *which* branch should
+   correspond to *which* real body part -- the only thing that ever anchors a branch to ground
+   truth is `BodyPartAttentionLoss` (pixel-wise CE against PifPaf/MaskRCNN masks), and that's one
+   of four losses in Stage 2, off by default (`data.masks_dir: ''`), and mask-availability-limited
+   (Market1501 has masks, DukeMTMC-reID does not).
+
+Conclusion: relevant, real gap. Fix -- isolate that one signal into its own pretraining stage
+that runs before Stage 1/2, so BPA already has a stable, real-part-anchored spatial split by the
+time CLIP prompts and the joint Stage 2 losses build on top of it.
+
+**New -- `examples/train_bpa_segmentation.py`** (Stage 0): trains BPBreID's full backbone +
+`pixel_classifier` via `BodyPartAttentionLoss` alone -- no id/triplet/align loss at all, pure
+supervised segmentation against ground-truth masks. Plain shuffled `DataLoader` (no PK sampler --
+no identity structure needed without an id/triplet loss). Saves a checkpoint in exactly Stage 2's
+own format (`{'state_dict': encoder.model.state_dict(), ...}`), so it's directly loadable via
+`model.checkpoint_path` in Stage 1/2's configs, or `--checkpoint-path` for Stage 3, with zero
+changes needed on the consuming side.
+
+**New -- `configs/stage0_bpa_segmentation.yaml`**: `data.masks_dir` defaults to the real, on-disk
+`pifpaf_maskrcnn_filtering` directory (confirmed present at
+`<data_dir>/market1501/masks/pifpaf_maskrcnn_filtering/{bounding_box_train,query,bounding_box_test,gt_bbox}`)
+-- unlike Stage 1/2's optional, empty-by-default `masks_dir`, this stage has no other loss to fall
+back on, so defaulting it off would make the stage meaningless out of the box.
+
+**Verified with real training runs, not just `--setup-only`** (both required after this session's
+own earlier lesson: `--setup-only` alone missed the TextualAttentionBlock fp16/fp32 bug because it
+exits before any real forward/backward runs):
+1. `--setup-only`: dataset/encoder/loader built cleanly, 12936 training images found with
+   `masks_dir=pifpaf_maskrcnn_filtering`.
+2. Real 1-epoch smoke run (batch 8, reduced from the config's default 32 to fit this dev machine's
+   8GB GPU during a full backbone backward pass -- same constraint Stage 2's own smoke test hit
+   earlier): completed cleanly in 255s, 1617 iterations, loss 0.94 avg (stabilizing in the
+   0.83-0.96 range), pixel accuracy already 71% avg after just one epoch from ImageNet init.
+   Checkpoint saved to `checkpoint.pth.tar`/`model_best.pth.tar`.
+3. **Stage 0 -> Stage 1 handoff, the actual point of this whole change**: ran Stage 1 with
+   `model.checkpoint_path` pointed at Stage 0's `model_best.pth.tar` -- log confirms `"Successfully
+   loaded pretrained weights from examples/logs/smoke_stage0/model_best.pth.tar"` (not a silent
+   fallback to ImageNet init), and the rest of Stage 1's run (visibility filtering, caching,
+   training) proceeded exactly as in every prior Stage 1 smoke test, confirming the checkpoint
+   format is fully compatible with zero changes to `examples/train_relational_prompts.py`.
+
+**Also fixed in passing**: reverted an accidental, untested, broken edit to
+`configs/stage2_relational_finetune.yaml` (`masks_dir: 'masks/pifpaf_maskrcnn_filtering'` -- wrong,
+since `pcr/utils/data/preprocessor.py::_load_raw_mask` already prepends `masks/` itself, so this
+would have looked for `masks/masks/pifpaf_maskrcnn_filtering/...`, which doesn't exist) found while
+reviewing `git status` before this commit -- discarded via `git checkout HEAD --`, not part of this
+change.
+
+**Not yet done**: `examples/run_pipeline.py` doesn't wire Stage 0 in (still Stage 1 -> Stage 2 ->
+Stage 3 only) -- Stage 0 is run standalone for now, its checkpoint passed manually into Stage 1's
+`model.checkpoint_path`. Full repo `python -m py_compile` sweep clean.

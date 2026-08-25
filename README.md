@@ -24,23 +24,45 @@ CLIP training stages are YAML-driven instead -- see `configs/`.
 
 ```bash
 pip install -e .
-pip install -e /path/to/bpbreid           # provides the `torchreid` package
-                                            # pcr/models/bpbreid_encoder.py imports
-pip install ftfy regex git+https://github.com/openai/CLIP.git   # frozen CLIP text encoder
 ```
+
+`clip` and `torchreid` (bpbreid) are vendored under `third_party/` and wired into `setup.py` via
+`package_dir` -- the single `pip install -e .` above builds both from this repo's own local source,
+no separate `pip install -e /path/to/bpbreid` or git-installed CLIP package needed.
 
 ## Pipeline stages
 
 ```
-Stage 1                cache_text_anchors.py    Stage 2                    Stage 3
-(train_relational        (build Stage 2's       (train_relational          (train_uda.py or
- _prompts.py)              alignment target)     _finetune.py)              train_usl.py)
-per-part CLIP prompt   -->                   --> supervised backbone   --> domain adaptation
-+ relation blocks,                               finetune + CLIP           (UDA) or single-
-backbone frozen                                  alignment + VAB           domain unsupervised
+Stage 0                Stage 1                cache_text_anchors.py    Stage 2                    Stage 3
+(train_bpa_             (train_relational        (build Stage 2's       (train_relational          (train_uda.py or
+ segmentation.py,         _prompts.py)              alignment target)     _finetune.py)              train_usl.py)
+ optional)
+BPA pixel-classifier   per-part CLIP prompt   -->                   --> supervised backbone   --> domain adaptation
+pretrained against     + relation blocks,                               finetune + CLIP           (UDA) or single-
+real part masks        backbone frozen                                  alignment + VAB           domain unsupervised
 ```
 
-Run the whole thing with `examples/run_pipeline.py`, or any subset of stages directly.
+Run the whole thing with `examples/run_pipeline.py`, or any subset of stages directly. Stage 0 is
+optional and stands alone -- its output checkpoint feeds into Stage 1's `model.checkpoint_path`
+(or Stage 2/3 directly) in place of ImageNet init; `run_pipeline.py` doesn't wire it in yet.
+
+### Stage 0 -- BPA segmentation pretraining (optional, masks required)
+
+```bash
+python examples/train_bpa_segmentation.py --config configs/stage0_bpa_segmentation.yaml
+```
+
+Trains BPBreID's own pixel-to-part classifier (`pixel_classifier`, the mechanism behind `A_m` in
+`METHODOLOGY.md` section 2.1) via plain supervised segmentation against ground-truth PifPaf/
+MaskRCNN part masks -- no id/triplet/CLIP-alignment loss at all, just `BodyPartAttentionLoss`
+alone. Motivation: without this, nothing in Stage 1/2's downstream signal ties a given branch
+index to a real anatomical region (Stage 1's per-branch prompts are learned placeholder tokens,
+not real body-part words, so CLIP never supplies that correspondence either) -- see `progress.md`
+for the full rationale. Only usable on datasets with masks on disk (`data.masks_dir` defaults to
+Market1501's real `pifpaf_maskrcnn_filtering` directory, unlike Stage 1/2's optional, empty-by-
+default `masks_dir` -- this stage has no other loss to fall back on). DukeMTMC-reID has no masks,
+so this stage only runs against Market1501. Produces a checkpoint in Stage 2's own save format,
+loadable via `model.checkpoint_path` in Stage 1/2's configs or `--checkpoint-path` for Stage 3.
 
 ### Stage 1 -- per-part CLIP prompt learning + relational attention
 

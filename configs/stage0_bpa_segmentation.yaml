@@ -1,0 +1,38 @@
+# Stage 0: pretrain BPBreID's pixel-to-part classifier (BPA) as a plain supervised segmentation
+# task, before Stage 1's CLIP prompt learning or Stage 2's joint finetuning ever run. See
+# examples/train_bpa_segmentation.py's module docstring for the full motivation -- in short,
+# nothing else in this pipeline ties a branch index to a real anatomical region unless masks
+# supervise it directly, and this stage isolates that one signal instead of leaving it as one of
+# four losses buried inside Stage 2.
+#
+# masks_dir defaults to the real, on-disk PifPaf/MaskRCNN masks for Market1501 (not empty, unlike
+# Stage 1/2's optional masks_dir) -- this stage has no id/triplet/align loss to fall back on, so
+# it is meaningless without them. DukeMTMC-reID has no masks on disk (per progress.md), so this
+# stage only runs against market1501.
+
+model:
+  backbone: hrnet32          # or resnet50 -- must match whatever Stage 1/2 config loads this checkpoint
+  checkpoint_path: ''        # optional external bpbreid checkpoint to continue from; empty = ImageNet init
+  dim_reduce_output: 512     # must equal clip.arch's text embed dim if Stage 1/2 will load this checkpoint
+  parts_num: 5                # K body parts; num_branches = 1 (foreground) + parts_num
+
+data:
+  dataset: market1501         # DukeMTMC-reID has no masks on disk -- market1501 only
+  data_dir: /home/lakshh/workspace/reid/datasets
+  height: 384
+  width: 128
+  batch_size: 32
+  workers: 4
+  masks_dir: pifpaf_maskrcnn_filtering   # real directory on disk under <data_dir>/market1501/masks/
+  masks_suffix: '.npy'
+
+optim:
+  lr: 0.00035
+  weight_decay: 0.0005
+  epochs: 60
+  step_size: 20
+
+logging:
+  logs_dir: examples/logs/stage0_bpa
+  print_freq: 10
+  seed: 1

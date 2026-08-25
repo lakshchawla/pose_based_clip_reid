@@ -1701,3 +1701,74 @@ change.
 **Not yet done**: `examples/run_pipeline.py` doesn't wire Stage 0 in (still Stage 1 -> Stage 2 ->
 Stage 3 only) -- Stage 0 is run standalone for now, its checkpoint passed manually into Stage 1's
 `model.checkpoint_path`. Full repo `python -m py_compile` sweep clean.
+
+---
+
+### 2026-08-26 03:15 — Added `train_relational_clip.py`: single-stage "generic CLIP" training,
+### replacing the two-stage CLIP-ReID scheme with the original CLIP paper's own loss
+
+Direct user request: skip the CLIP-ReID-style two-stage split (frozen backbone + SupCon, then
+frozen prompts + I2T against a precomputed prototype table) and instead train every learnable
+module jointly, in one forward/backward pass per iteration, using the losses from the actual CLIP
+paper (Radford et al. 2021) rather than CLIP-ReID's adaptation of them. Reuses essentially every
+existing module unchanged (`BPBReIDEncoder`, `ClipTextEncoder`, `PromptLearner` +
+`TextualAttentionBlock`, `VisualAttentionBlock`, `PartTripletLoss`) -- only the training procedure
+and loss combination changes.
+
+**New -- `pcr/loss/clip_contrastive_loss.py::ClipContrastiveLoss`**: a faithful port of the CLIP
+paper's own diagonal symmetric cross-entropy loss (row *i*'s only positive is column *i* -- the
+paper's own `labels = np.arange(n)`), with a learned `logit_scale` (init `log(1/0.07)`, clamped to
+`log(100)` every forward pass, exactly matching the paper's own training-stability convention).
+Deliberately NOT `SupConLoss` (pcr/loss/clip_supcon_loss.py) -- that file's own docstring already
+documents why CLIP-ReID moved away from the paper's literal loss (multi-positive identity masking
+instead of diagonal-only); this new file is the literal version, requested explicitly instead of
+the adapted one. Normalizes both inputs internally (unlike `SupConLoss`/`I2TLoss`, which assume
+pre-normalized input) since the paper's own `logit_scale` calibration only makes sense against
+true cosine similarities, and `VisualAttentionBlock`'s residual can otherwise leave the visual
+side's norm adrift from 1.
+
+**New -- `examples/train_relational_clip.py`**: single training loop, PK-sampled batches (needed
+for `PartTripletLoss`, which this script also uses), full BPBreID forward+backward every
+iteration (no caching -- unlike Stage 1, nothing here is frozen), full CLIP text forward every
+iteration too (no precomputed prototype table -- unlike Stage 2). Two loss terms only, matching
+exactly what was asked for: `ClipContrastiveLoss` per branch (foreground + `VisualAttentionBlock`
+-mixed parts), summed, plus `PartTripletLoss` across all branches. No id loss, no BPA loss (Stage
+2 has four losses; this script deliberately has two). `torch.amp.GradScaler` reused from Stage 1's
+own rationale (the CLIP text tower still runs in fp16 every iteration here, same underflow risk;
+every trainable parameter, including the new `ClipContrastiveLoss.logit_scale`, is fp32, so the
+scaler stays harmless for all of them -- same argument Stage 1's own docstring already makes,
+extended to now also cover the jointly-trainable BPBreID backbone). Saves a checkpoint in exactly
+Stage 2's own format, directly loadable by `train_uda.py`/`train_usl.py --checkpoint-path`
+unchanged, plus `vab.pth`/`prompt_learner.pth` for completeness (no downstream script in this
+single-stage design actually needs to reload either, unlike Stage 1's `prompt_learner.pth` ->
+`cache_text_anchors.py`).
+
+**New -- `configs/relational_clip.yaml`**.
+
+**Known, accepted tradeoff, not a bug**: PK sampling (multiple images per identity per batch,
+required by the triplet loss) collides with the CLIP paper's own diagonal-only assumption (each
+row has exactly one positive) -- other same-identity images in the same batch get treated as
+negatives by `ClipContrastiveLoss`. This is the literal, faithful cost of using the paper's own
+loss rather than adapting it (as `SupConLoss` already does) to a labeled setting with repeated
+classes per batch -- documented in the loss file's own docstring rather than silently smoothed
+over.
+
+**Verified with a real training run, not `--setup-only` alone** (per this session's own established
+lesson -- `--setup-only` exits before any real forward/backward runs, and already missed one real
+bug in an earlier stage):
+1. `--setup-only`: dataset/encoder/prompt-learner/loader built cleanly.
+2. Real 1-epoch smoke run (batch 8, reduced from the config's default 32 for this dev machine's
+   8GB GPU during a full backbone backward pass -- same constraint every other full-backbone stage
+   here has hit): completed cleanly, 375 iterations, no dtype errors (the first time GradScaler
+   has ever wrapped a full BPBreID backward pass, and the first time the fp16 CLIP text path and a
+   trainable BPBreID backbone have run together in the same step), no OOM. Loss finite throughout
+   (~12.6-13.9 total, contrastive ~12.3-13.6, triplet ~0.31-0.44), `logit_scale` tuning down
+   smoothly from its `log(1/0.07)` init (~14.29 -> ~14.25 across one epoch), `VAB gate` moving up
+   from 0 as expected. End-of-epoch eval: Mean AP 0.7%, top-1 1.7% -- lower than Stage 2's own
+   1-epoch smoke result (2.2% mAP) but expected, not a red flag: `PromptLearner`/
+   `TextualAttentionBlock` are training from scratch simultaneously with the backbone here, unlike
+   Stage 2, which finetunes against already-Stage-1-trained prompts.
+3. Checkpoint files (`checkpoint.pth.tar`, `model_best.pth.tar`, `vab.pth`, `prompt_learner.pth`)
+   all saved correctly.
+
+Full repo `python -m py_compile` sweep clean.

@@ -1,0 +1,58 @@
+# Single-stage alternative to stage1_relational_prompts.yaml + stage2_relational_finetune.yaml:
+# every module (BPBreID backbone + BPA, VisualAttentionBlock, PromptLearner + TextualAttentionBlock)
+# trains jointly, one forward/backward pass per iteration, using the original CLIP paper's own
+# contrastive loss (pcr/loss/clip_contrastive_loss.py) instead of CLIP-ReID's two-stage SupCon+I2T
+# scheme. See examples/train_relational_clip.py's module docstring for the full design.
+
+model:
+  backbone: hrnet32          # or resnet50
+  checkpoint_path: ''        # optional: Stage 0's BPA-pretrained checkpoint, or any external
+                              # bpbreid checkpoint; empty = ImageNet init
+  dim_reduce_output: 512     # must equal clip.arch's text embed dim (512 for ViT-B/32 and ViT-B/16)
+  parts_num: 5                # K body parts; num_branches = 1 (foreground) + parts_num
+
+clip:
+  arch: ViT-B/32
+  n_ctx: 4                    # learnable context tokens per (identity, branch)
+
+tab:
+  num_heads: 4                 # TextualAttentionBlock's attention heads, over the K part branches
+  num_layers: 1
+
+vab:
+  num_heads: 4                 # VisualAttentionBlock's attention heads, over the K part branches
+  num_layers: 1
+
+visibility:
+  # upstream candidate-acceptance gate (reid_pipeline_plan.md's part-relational-attention
+  # addendum, section 0.1) -- see pcr/utils/visibility_filter.py.
+  lambda_v_min: 0.5
+
+data:
+  dataset: market1501         # or dukemtmc-reid
+  data_dir: /home/lakshh/workspace/reid/datasets
+  height: 384
+  width: 128
+  batch_size: 32
+  num_instances: 4             # PK sampling: batch_size // num_instances identities per batch --
+                                # required by the triplet loss this script also uses
+  workers: 4
+
+loss:
+  contrastive_weight: 1.0
+  triplet_weight: 1.0
+  triplet_margin: 0.3
+
+optim:
+  lr: 0.00035
+  weight_decay: 0.0001
+  epochs: 120
+  warmup_epochs: 5
+  warmup_lr_init: 0.00001
+  lr_min: 0.000001
+
+logging:
+  logs_dir: examples/logs/relational_clip
+  print_freq: 10
+  eval_step: 10
+  seed: 1

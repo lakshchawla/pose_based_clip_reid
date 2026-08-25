@@ -89,8 +89,8 @@ class PromptLearner(nn.Module):
         TextualAttentionBlock pass mixes all K parts' context together, then sliced back apart)."""
         fg = self._splice(self.fg_ctx[labels].type(self.prompt_dtype))
 
-        raw_part_ctx = self.part_ctx[labels].type(self.prompt_dtype)  # [B, K*n_ctx, ctx_dim]
-        mixed_part_ctx = self.tab(raw_part_ctx)
+        raw_part_ctx = self.part_ctx[labels]  # [B, K*n_ctx, ctx_dim], fp32 -- matches tab's fp32 params
+        mixed_part_ctx = self.tab(raw_part_ctx).type(self.prompt_dtype)  # cast only after tab, like fg
         parts = []
         for k in range(self.num_parts):
             start = k * self.n_ctx

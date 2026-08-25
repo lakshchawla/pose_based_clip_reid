@@ -11,7 +11,7 @@ PCR combines three techniques into one pipeline, per `reid_pipeline_plan.md`:
    self-paced reliability filtering -> contrastive memory-bank loss -> DSBN) for unsupervised
    domain adaptation, or an ICE-style single-domain unsupervised alternative.
 4. **Part-relational attention** -- bidirectional self-attention across a person's K body-part
-   tokens, on both the visual side (VisualRelationBlock) and the text side (TextRelationBlock),
+   tokens, on both the visual side (VisualAttentionBlock) and the text side (TextualAttentionBlock),
    in Stage 1/2 only (Stage 3 is untouched by this). See `pcr/models/relation_blocks.py` and
    `progress.md` for the design.
 
@@ -37,7 +37,7 @@ Stage 1                cache_text_anchors.py    Stage 2                    Stage
  _prompts.py)              alignment target)     _finetune.py)              train_usl.py)
 per-part CLIP prompt   -->                   --> supervised backbone   --> domain adaptation
 + relation blocks,                               finetune + CLIP           (UDA) or single-
-backbone frozen                                  alignment + VRB           domain unsupervised
+backbone frozen                                  alignment + VAB           domain unsupervised
 ```
 
 Run the whole thing with `examples/run_pipeline.py`, or any subset of stages directly.
@@ -50,11 +50,11 @@ python examples/train_relational_prompts.py --config configs/stage1_relational_p
 
 Frozen BPBreID encoder (ImageNet-init by default, or set `model.checkpoint_path` to an
 externally-pretrained BPBreID checkpoint) + frozen CLIP text encoder. Trainable: `PromptLearner`
-(per-(identity, branch) learnable prompt context, owning a `TextRelationBlock` that mixes the K
-part branches' context together before any part's prompt is built) and a `VisualRelationBlock`
+(per-(identity, branch) learnable prompt context, owning a `TextualAttentionBlock` that mixes the K
+part branches' context together before any part's prompt is built) and a `VisualAttentionBlock`
 (mixes the K part branches' pooled visual features the same way). The training set is filtered
 first by a visibility-index threshold (`visibility.lambda_v_min`) -- see
-`pcr/utils/visibility_filter.py`. Produces `prompt_learner.pth` and `vrb.pth` under
+`pcr/utils/visibility_filter.py`. Produces `prompt_learner.pth` and `vab.pth` under
 `logging.logs_dir`.
 
 ```bash
@@ -72,16 +72,16 @@ python examples/train_relational_finetune.py --config configs/stage2_relational_
 ```
 
 Set `stage1.prompt_dir` in the config to Stage 1's `logging.logs_dir` (this is where both
-`text_prototypes.pth` and `vrb.pth` are read from). Trains the full BPBreID encoder with real
+`text_prototypes.pth` and `vab.pth` are read from). Trains the full BPBreID encoder with real
 identity labels: id loss (foreground branch only) + triplet loss + an alignment loss against
 Stage 1's frozen text prototypes, plus an optional BPA (body-part-attention) loss if
 `data.masks_dir` is set (masks are source-domain-only on disk for Market1501; DukeMTMC-reID has
-none). `VisualRelationBlock` continues training here (loaded from Stage 1's `vrb.pth`, jointly
-with the now-unfrozen backbone) -- unlike `PromptLearner`/`TextRelationBlock`, which are frozen
+none). `VisualAttentionBlock` continues training here (loaded from Stage 1's `vab.pth`, jointly
+with the now-unfrozen backbone) -- unlike `PromptLearner`/`TextualAttentionBlock`, which are frozen
 and discarded after Stage 1. No per-branch visibility gating inside the loss loop here; the same
 `visibility.lambda_v_min` filter Stage 1 uses is applied to this stage's own training set instead.
 Produces a checkpoint directly loadable by Stage 3's `--checkpoint-path`, unchanged (Stage 3 is
-untouched by VisualRelationBlock -- its own weights save separately and aren't consumed yet).
+untouched by VisualAttentionBlock -- its own weights save separately and aren't consumed yet).
 
 ### Stage 3 -- domain adaptation
 

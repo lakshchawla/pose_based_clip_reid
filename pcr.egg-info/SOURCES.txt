@@ -7,7 +7,6 @@ pcr/trainers_usl.py
 pcr.egg-info/PKG-INFO
 pcr.egg-info/SOURCES.txt
 pcr.egg-info/dependency_links.txt
-pcr.egg-info/requires.txt
 pcr.egg-info/top_level.txt
 pcr/datasets/__init__.py
 pcr/datasets/dukemtmc.py
@@ -30,6 +29,7 @@ pcr/models/fusion_head.py
 pcr/models/hm.py
 pcr/models/id_classifier.py
 pcr/models/prompt_learner.py
+pcr/models/relation_blocks.py
 pcr/models/resnet.py
 pcr/utils/__init__.py
 pcr/utils/config.py
@@ -40,6 +40,7 @@ pcr/utils/meters.py
 pcr/utils/osutils.py
 pcr/utils/part_distance.py
 pcr/utils/serialization.py
+pcr/utils/visibility_filter.py
 pcr/utils/data/__init__.py
 pcr/utils/data/base_dataset.py
 pcr/utils/data/preprocessor.py

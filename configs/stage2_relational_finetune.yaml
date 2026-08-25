@@ -1,10 +1,10 @@
 # Stage 2: supervised backbone finetune. BPBreID backbone + attention are trainable; Stage 1's
 # prompts/CLIP text encoder are frozen (Stage 1's frozen text-prototype table is loaded from
-# stage1.prompt_dir, not recomputed here). VisualRelationBlock is *not* frozen -- it continues
+# stage1.prompt_dir, not recomputed here). VisualAttentionBlock is *not* frozen -- it continues
 # training here, starting from Stage 1's weights (also read from stage1.prompt_dir). See
 # examples/train_relational_finetune.py.
 #
-# Renamed from stage2_backbone_finetune.yaml -- pairs with the renamed script; the vrb:/
+# Renamed from stage2_backbone_finetune.yaml -- pairs with the renamed script; the vab:/
 # visibility: sections below are the new content relative to that file.
 
 model:
@@ -17,13 +17,13 @@ model:
 
 stage1:
   # directory produced by examples/train_relational_prompts.py + examples/cache_text_anchors.py --
-  # reads text_prototypes.pth (the frozen alignment target) and vrb.pth (VisualRelationBlock's
+  # reads text_prototypes.pth (the frozen alignment target) and vab.pth (VisualAttentionBlock's
   # Stage-1-trained starting weights, which this stage continues training) from here
   prompt_dir: examples/logs/stage1_prompts
 
-vrb:
-  num_heads: 4                 # must match stage1's vrb.num_heads/num_layers -- these define the
-  num_layers: 1                # architecture vrb.pth's weights were trained for
+vab:
+  num_heads: 4                 # must match stage1's vab.num_heads/num_layers -- these define the
+  num_layers: 1                # architecture vab.pth's weights were trained for
 
 visibility:
   # same upstream candidate-acceptance gate as Stage 1 (pcr/utils/visibility_filter.py), applied

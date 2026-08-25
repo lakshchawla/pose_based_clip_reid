@@ -1,12 +1,12 @@
 """Per-identity, per-body-part prompt learning, generalized from CLIP-ReID's PromptLearner
 (../CLIP-ReID/model/make_model_clipreid.py, lines 191-239), with a relational-mixing step
-(TextRelationBlock, pcr/models/relation_blocks.py) across the K part branches' context tokens
+(TextualAttentionBlock, pcr/models/relation_blocks.py) across the K part branches' context tokens
 before any part's prompt is assembled -- see progress.md's entry on this change for why.
 
 Branch 0 (foreground, matching BPBreIDEncoder.forward's own convention) stays completely outside
 the relational-mixing step: it keeps its own independent learnable context, exactly as before
-this file gained a TextRelationBlock. Branches 1..K (the K parts) share one flat context sequence
-that TextRelationBlock mixes together, then this class slices back into K per-part 4-token
+this file gained a TextualAttentionBlock. Branches 1..K (the K parts) share one flat context sequence
+that TextualAttentionBlock mixes together, then this class slices back into K per-part 4-token
 blocks. See pcr/models/relation_blocks.py's own module docstring for why foreground is excluded
 (the source plan frames it as an optional addition, not the base case).
 """
@@ -14,7 +14,7 @@ import clip
 import torch
 import torch.nn as nn
 
-from .relation_blocks import TextRelationBlock
+from .relation_blocks import TextualAttentionBlock
 
 
 class PromptLearner(nn.Module):
@@ -25,8 +25,8 @@ class PromptLearner(nn.Module):
     instead of two, since they must always be equal for the prefix/suffix slicing to line up.
 
     Two separate learnable context tensors, not one: `fg_ctx` (foreground, [num_identities,
-    n_ctx, ctx_dim], never touched by TextRelationBlock) and `part_ctx` (the K parts, flat as
-    [num_identities, K*n_ctx, ctx_dim] so TextRelationBlock can attend across all of them at
+    n_ctx, ctx_dim], never touched by TextualAttentionBlock) and `part_ctx` (the K parts, flat as
+    [num_identities, K*n_ctx, ctx_dim] so TextualAttentionBlock can attend across all of them at
     once -- a transformer layer needs its input as one sequence, not K separate blocks).
 
     Deviation from CLIP-ReID's original, found by actually running the training loop (back when
@@ -40,7 +40,7 @@ class PromptLearner(nn.Module):
     """
 
     def __init__(self, num_identities, num_parts, clip_text_encoder, n_ctx=4,
-                 trb_num_heads=4, trb_num_layers=1, device='cuda'):
+                 tab_num_heads=4, tab_num_layers=1, device='cuda'):
         super(PromptLearner, self).__init__()
         ctx_dim = clip_text_encoder.embed_dim
         dtype = clip_text_encoder.dtype
@@ -60,7 +60,7 @@ class PromptLearner(nn.Module):
         nn.init.normal_(part_vectors, std=0.02)
         self.part_ctx = nn.Parameter(part_vectors)
 
-        self.trb = TextRelationBlock(ctx_dim, num_heads=trb_num_heads, num_layers=trb_num_layers)
+        self.tab = TextualAttentionBlock(ctx_dim, num_heads=tab_num_heads, num_layers=tab_num_layers)
         self.prompt_dtype = dtype
 
         # not trained, but must move with the module (.cuda()/.to()) -- registered as buffers
@@ -86,11 +86,11 @@ class PromptLearner(nn.Module):
         """labels: [B] identity indices. Returns a list of `num_branches` tensors, each
         [B, 77, ctx_dim] -- index 0 is the foreground prompt (built from the unmixed fg_ctx),
         indices 1..K are the K part prompts (built from part_ctx after one shared
-        TextRelationBlock pass mixes all K parts' context together, then sliced back apart)."""
+        TextualAttentionBlock pass mixes all K parts' context together, then sliced back apart)."""
         fg = self._splice(self.fg_ctx[labels].type(self.prompt_dtype))
 
         raw_part_ctx = self.part_ctx[labels].type(self.prompt_dtype)  # [B, K*n_ctx, ctx_dim]
-        mixed_part_ctx = self.trb(raw_part_ctx)
+        mixed_part_ctx = self.tab(raw_part_ctx)
         parts = []
         for k in range(self.num_parts):
             start = k * self.n_ctx

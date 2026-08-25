@@ -1,11 +1,11 @@
 # Stage 1: per-part CLIP prompt learning, with relational mixing across a person's K part
-# tokens on both sides -- TextRelationBlock (owned by PromptLearner) on the text side,
-# VisualRelationBlock on the image side. BPBreID backbone and the CLIP text encoder are both
-# frozen; PromptLearner (incl. TextRelationBlock) and VisualRelationBlock train. See
+# tokens on both sides -- TextualAttentionBlock (owned by PromptLearner) on the text side,
+# VisualAttentionBlock on the image side. BPBreID backbone and the CLIP text encoder are both
+# frozen; PromptLearner (incl. TextualAttentionBlock) and VisualAttentionBlock train. See
 # examples/train_relational_prompts.py. Run examples/cache_text_anchors.py against this same
 # config afterward to build Stage 2's frozen text-prototype table.
 #
-# Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the trb:/vrb:/
+# Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the tab:/vab:/
 # visibility: sections below are the new content relative to that file.
 
 model:
@@ -15,15 +15,15 @@ model:
   parts_num: 5                # K body parts; num_branches = 1 (foreground) + parts_num
 
 clip:
-  arch: ViT-B/32
+  arch: ViT-B/16
   n_ctx: 4                    # learnable context tokens per (identity, branch)
 
-trb:
-  num_heads: 4                 # TextRelationBlock's attention heads, over the K part branches
+tab:
+  num_heads: 4                 # TextualAttentionBlock's attention heads, over the K part branches
   num_layers: 1                # start shallow -- see progress.md for the ablation this should feed
 
-vrb:
-  num_heads: 4                 # VisualRelationBlock's attention heads, over the K part branches
+vab:
+  num_heads: 4                 # VisualAttentionBlock's attention heads, over the K part branches
   num_layers: 1                # start shallow -- see progress.md for the ablation this should feed
 
 visibility:
@@ -38,8 +38,8 @@ data:
   data_dir: /home/lakshh/workspace/reid/datasets
   height: 384
   width: 128
-  batch_size: 64               # random image sub-batch size per SupCon training step
-  cache_batch_size: 64         # batch size for the one-off full-dataset feature-caching pass
+  batch_size: 32               # random image sub-batch size per SupCon training step
+  cache_batch_size: 32        # batch size for the one-off full-dataset feature-caching pass
   workers: 4
 
 optim:

@@ -1,8 +1,8 @@
 """Stage 1: per-part CLIP prompt learning, with relational mixing across a person's K part
-tokens on both sides -- TextRelationBlock (owned by PromptLearner) on the text side,
-VisualRelationBlock on the image side. Frozen BPBreID encoder + frozen CLIP text encoder; the
-only trainable things are PromptLearner (which includes TextRelationBlock as a submodule) and
-VisualRelationBlock. Mirrors CLIP-ReID's own do_train_stage1
+tokens on both sides -- TextualAttentionBlock (owned by PromptLearner) on the text side,
+VisualAttentionBlock on the image side. Frozen BPBreID encoder + frozen CLIP text encoder; the
+only trainable things are PromptLearner (which includes TextualAttentionBlock as a submodule) and
+VisualAttentionBlock. Mirrors CLIP-ReID's own do_train_stage1
 (../CLIP-ReID/processor/processor_clipreid_stage1.py), generalized per-branch: the whole
 (visibility-filtered) training set's part-embeddings are cached once under no_grad, then every
 step draws a random image sub-batch (not PK-sampled -- matches the reference's plain
@@ -14,19 +14,19 @@ Two scope notes, both explicit decisions logged in progress.md, not defaults sli
   below (pcr/utils/visibility_filter.py) rejecting whole images before caching, not by skipping
   individual (sample, branch) pairs during training the way the pre-relational-attention version
   of this file did.
-- VisualRelationBlock and TextRelationBlock both operate on the K=5 part branches only. The
+- VisualAttentionBlock and TextualAttentionBlock both operate on the K=5 part branches only. The
   foreground/global branch (branch 0) keeps its own independent context and pooled feature,
   untouched by either relation block -- see pcr/models/relation_blocks.py's module docstring.
 
 Renamed from train_prompts.py -- this is the file that changed for the part-relational-attention
 plan (see progress.md); train_finetune.py became train_relational_finetune.py for the same
-reason (Stage 2 also changed, to carry VisualRelationBlock forward and drop visibility gating).
+reason (Stage 2 also changed, to carry VisualAttentionBlock forward and drop visibility gating).
 
 Produces two files consumed by examples/cache_text_anchors.py (not by Stage 2 directly -- see
 that script's own docstring for why the final text-prototype computation is a separate step):
-prompt_learner.pth (PromptLearner's state, including TextRelationBlock) and vrb.pth
-(VisualRelationBlock's state -- unlike the text-side modules, VRB is *not* discarded after Stage
-1; Stage 2 loads vrb.pth to continue training the same VisualRelationBlock instance).
+prompt_learner.pth (PromptLearner's state, including TextualAttentionBlock) and vab.pth
+(VisualAttentionBlock's state -- unlike the text-side modules, VAB is *not* discarded after Stage
+1; Stage 2 loads vab.pth to continue training the same VisualAttentionBlock instance).
 
 Config-driven (YAML), not argparse -- see configs/stage1_relational_prompts.yaml. This is a
 deliberate deviation from the rest of pcr2 (train_uda.py/train_usl.py stay argparse-only, decided
@@ -48,7 +48,7 @@ from pcr import datasets
 from pcr.models.bpbreid_encoder import BPBReIDEncoder, BPBReIDModelCfg
 from pcr.models.clip_text_encoder import ClipTextEncoder
 from pcr.models.prompt_learner import PromptLearner
-from pcr.models.relation_blocks import VisualRelationBlock
+from pcr.models.relation_blocks import VisualAttentionBlock
 from pcr.loss.clip_supcon_loss import SupConLoss
 from pcr.utils.config import load_yaml_config
 from pcr.utils.data import transforms as T
@@ -103,7 +103,7 @@ def build_encoder(cfg):
 
 def main():
     parser = argparse.ArgumentParser(description="PCR Stage 1: per-part CLIP prompt learning")
-    parser.add_argument('--config', type=str, required=True, metavar='PATH')
+    parser.add_argument('--config', type=str, metavar='PATH', default="configs/stage1_relational_prompts.yaml")
     parser.add_argument('--setup-only', action='store_true',
                          help="build dataset/encoder/prompt-learner/cache, print shapes, exit "
                               "before the training loop")
@@ -132,10 +132,10 @@ def main_worker(cfg, setup_only=False):
     encoder = build_encoder(cfg)
     text_encoder = ClipTextEncoder(clip_arch=cfg.clip.arch, device='cuda').cuda()
     prompt_learner = PromptLearner(num_identities, num_parts, text_encoder, n_ctx=cfg.clip.n_ctx,
-                                    trb_num_heads=cfg.trb.num_heads, trb_num_layers=cfg.trb.num_layers,
+                                    tab_num_heads=cfg.tab.num_heads, tab_num_layers=cfg.tab.num_layers,
                                     device='cuda').cuda()
-    vrb = VisualRelationBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.vrb.num_heads,
-                               num_layers=cfg.vrb.num_layers).cuda()
+    vab = VisualAttentionBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.vab.num_heads,
+                               num_layers=cfg.vab.num_layers).cuda()
 
     print("==> Filtering training set by visibility index (threshold={})".format(
         cfg.visibility.lambda_v_min))
@@ -162,7 +162,7 @@ def main_worker(cfg, setup_only=False):
         return
 
     supcon = SupConLoss(temperature=cfg.loss.temperature).cuda()
-    trainable_params = list(prompt_learner.parameters()) + list(vrb.parameters())
+    trainable_params = list(prompt_learner.parameters()) + list(vab.parameters())
     optimizer = torch.optim.Adam(trainable_params, lr=cfg.optim.lr,
                                   weight_decay=cfg.optim.weight_decay)
     scheduler = WarmupCosineLR(optimizer, max_epochs=cfg.optim.epochs,
@@ -173,7 +173,7 @@ def main_worker(cfg, setup_only=False):
     # own dtype exactly, see pcr/models/clip_text_encoder.py's docstring), and CLIP-ReID's own
     # stage-1 loop always wraps its backward in a GradScaler to guard against fp16 gradient
     # underflow through the text transformer -- ported faithfully rather than assuming raw fp16
-    # backward is fine. VisualRelationBlock and PromptLearner's own parameters run in fp32
+    # backward is fine. VisualAttentionBlock and PromptLearner's own parameters run in fp32
     # (GradScaler is harmless for fp32 leaves), so one scaler covers everything trainable.
     scaler = torch.amp.GradScaler('cuda')
 
@@ -182,7 +182,7 @@ def main_worker(cfg, setup_only=False):
 
     for epoch in range(cfg.optim.epochs):
         prompt_learner.train()
-        vrb.train()
+        vab.train()
         epoch_loss = 0.0
         epoch_start = time.time()
         iter_list = torch.randperm(num_images, device='cuda')
@@ -200,7 +200,7 @@ def main_worker(cfg, setup_only=False):
             loss = supcon(fg_visual, fg_text, b_labels, b_labels) \
                 + supcon(fg_text, fg_visual, b_labels, b_labels)
 
-            part_visual = vrb(b_features[:, 1:, :])  # [b, K, D], relationally mixed
+            part_visual = vab(b_features[:, 1:, :])  # [b, K, D], relationally mixed
             for k in range(num_parts):
                 part_text = text_encoder(prompts[1 + k], prompt_learner.tokenized_prompts).float()
                 visual_k = part_visual[:, k, :]
@@ -213,17 +213,17 @@ def main_worker(cfg, setup_only=False):
             epoch_loss += loss.item()
 
             if (it + 1) % cfg.logging.print_freq == 0:
-                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\tLR {:.2e}\tVRB gate {:.3f}'.format(
+                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\tLR {:.2e}\tVAB gate {:.3f}'.format(
                     epoch, it + 1, iters_per_epoch, loss.item(), optimizer.param_groups[0]['lr'],
-                    torch.tanh(vrb.gate).item()))
+                    torch.tanh(vab.gate).item()))
 
         scheduler.step()
         print('Epoch {} done in {:.1f}s, avg loss {:.4f}'.format(
             epoch, time.time() - epoch_start, epoch_loss / iters_per_epoch))
 
     torch.save(prompt_learner.state_dict(), osp.join(cfg.logging.logs_dir, 'prompt_learner.pth'))
-    torch.save(vrb.state_dict(), osp.join(cfg.logging.logs_dir, 'vrb.pth'))
-    print('==> Saved prompt_learner.pth and vrb.pth to {}. Run examples/cache_text_anchors.py '
+    torch.save(vab.state_dict(), osp.join(cfg.logging.logs_dir, 'vab.pth'))
+    print('==> Saved prompt_learner.pth and vab.pth to {}. Run examples/cache_text_anchors.py '
           'next to build text_prototypes.pth for Stage 2.'.format(cfg.logging.logs_dir))
 
     end_time = time.monotonic()

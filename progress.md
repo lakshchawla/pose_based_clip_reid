@@ -1603,3 +1603,31 @@ full repo-wide `py_compile` sweep (`pcr/`, `examples/`) -- all clean. No synthet
 tests or real training smoke runs have been performed for this change -- the `pcr2-run` conda env's
 `torch` installation was found broken mid-session (unrelated to this change) and has not yet been
 repaired, so runtime verification remains blocked pending that fix.
+
+---
+
+### 2026-08-25 14:05 — Renamed VisualRelationBlock/TextRelationBlock to VisualAttentionBlock/
+### TextualAttentionBlock repo-wide, per direct user request
+
+Cosmetic rename, no behavior change: `pcr/models/relation_blocks.py::VisualRelationBlock` ->
+`VisualAttentionBlock`, `TextRelationBlock` -> `TextualAttentionBlock`. For consistency, the
+short-hand `VRB`/`TRB` used throughout comments/docstrings/log messages became `VAB`/`TAB`, and
+every lowercase identifier following that abbreviation was renamed to match: local/attribute
+variables (`vrb`/`trb` -> `vab`/`tab`, e.g. `PromptLearner.tab`), constructor kwargs
+(`trb_num_heads`/`trb_num_layers` -> `tab_num_heads`/`tab_num_layers`), YAML config sections
+(`vrb:`/`trb:` -> `vab:`/`tab:` in both `configs/stage1_relational_prompts.yaml` and
+`configs/stage2_relational_finetune.yaml`), and the saved/loaded checkpoint filename (`vrb.pth` ->
+`vab.pth`, both where Stage 1 saves it and where Stage 2 loads/re-saves it). Applied across
+`pcr/models/relation_blocks.py`, `pcr/models/prompt_learner.py`, `pcr/utils/visibility_filter.py`,
+`examples/train_relational_prompts.py`, `examples/train_relational_finetune.py`,
+`examples/cache_text_anchors.py`, `README.md`, `METHODOLOGY.md`.
+
+This entry's own prose, and every entry above it, still says `VisualRelationBlock`/
+`VisualRelationBlock`/`VRB`/`TRB`/`vrb.pth` where that was the accurate name at the time -- left
+untouched, matching this file's append-only convention (a progress log describes what was true
+when it was written, not the current state of the code).
+
+Full repo `python -m py_compile` sweep clean after the rename. Not re-run: the Stage 1
+`--setup-only` smoke check (already verified working under the old names earlier today, in
+`pcr2-run`) -- the rename touched no logic, only names, so it wasn't re-run, but should be if
+there's any doubt.

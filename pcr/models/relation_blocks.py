@@ -1,6 +1,6 @@
 """Bidirectional relational attention across a person's K body-part tokens, applied on both the
-visual side (VisualRelationBlock, over BPAM's pooled part features) and the text side
-(TextRelationBlock, over PromptLearner's per-part learnable context tokens) -- see
+visual side (VisualAttentionBlock, over BPAM's pooled part features) and the text side
+(TextualAttentionBlock, over PromptLearner's per-part learnable context tokens) -- see
 progress.md's entry on this change for the full design rationale.
 
 Neither block masks anything: this plan's operating assumption (see reid_pipeline_plan.md's
@@ -13,7 +13,7 @@ part is visible.
 Only foreground/global stays outside both blocks entirely, in this build: relational mixing
 covers the K=5 part branches (branches 1..K in BPBreIDEncoder's convention), not the foreground
 branch (branch 0). The source plan describes the foreground vector as an *optional* addition to
-VRB's input ("the K part vectors... optionally plus the foreground vector") rather than the base
+VAB's input ("the K part vectors... optionally plus the foreground vector") rather than the base
 case, so this keeps to the base case -- foreground keeps its own independent embedding and its
 own independent prompt, unmixed, exactly as before this file existed.
 """
@@ -21,11 +21,11 @@ import torch
 import torch.nn as nn
 
 
-class VisualRelationBlock(nn.Module):
+class VisualAttentionBlock(nn.Module):
     """Bidirectional self-attention over the K pooled part-feature vectors (image side).
     Permanent inference-time module: trained in Stage 1 (backbone/BPAM frozen, this is one of
     the few trainable things), then carried over and continues training in Stage 2 (jointly with
-    the now-unfrozen backbone) -- never discarded, unlike TextRelationBlock.
+    the now-unfrozen backbone) -- never discarded, unlike TextualAttentionBlock.
 
     A learned, zero-initialized residual gate keeps this a no-op at initialization
     (`tanh(0) == 0`, so `forward` returns `part_tokens` unchanged the moment training starts) and
@@ -35,7 +35,7 @@ class VisualRelationBlock(nn.Module):
     """
 
     def __init__(self, dim, num_heads=4, num_layers=1, ff_dim=None):
-        super(VisualRelationBlock, self).__init__()
+        super(VisualAttentionBlock, self).__init__()
         ff_dim = ff_dim or dim * 2
         layer = nn.TransformerEncoderLayer(
             d_model=dim, nhead=num_heads, dim_feedforward=ff_dim,
@@ -51,7 +51,7 @@ class VisualRelationBlock(nn.Module):
         return part_tokens + torch.tanh(self.gate) * relation_out
 
 
-class TextRelationBlock(nn.Module):
+class TextualAttentionBlock(nn.Module):
     """Bidirectional self-attention over a person's K*n_ctx learnable part-context tokens (text
     side), run before any single part's prompt is assembled -- so a part's context can be
     informed by every other part's, which the frozen CLIP text encoder's own causally-masked
@@ -61,13 +61,13 @@ class TextRelationBlock(nn.Module):
     discarded once Stage 1 ends -- cache_text_anchors.py reads their state once to build the
     frozen text-prototype table Stage 2 actually uses, and neither is loaded again afterward.
 
-    No gate, no residual, unlike VisualRelationBlock: this class's own life ends the moment Stage
+    No gate, no residual, unlike VisualAttentionBlock: this class's own life ends the moment Stage
     1 does, so there's no "does this stay a no-op at inference" concern to guard against the way
-    there is for VRB.
+    there is for VAB.
     """
 
     def __init__(self, ctx_dim, num_heads=4, num_layers=1):
-        super(TextRelationBlock, self).__init__()
+        super(TextualAttentionBlock, self).__init__()
         layer = nn.TransformerEncoderLayer(
             d_model=ctx_dim, nhead=num_heads, dim_feedforward=ctx_dim * 2,
             batch_first=True, norm_first=True,

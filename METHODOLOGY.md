@@ -107,14 +107,14 @@ depending on whether $m$ is the foreground branch or a part branch:
 
 - **Foreground** ($m=0$): $[V_\cdot]_{y,0} = C_{fg}[y] \in \mathbb{R}^{M_{ctx}\times 512}$, read
   directly off a learnable tensor $C_{fg} \in \mathbb{R}^{N_{id}\times M_{ctx}\times 512}$.
-- **Parts** ($m=1..K$): $[V_\cdot]_{y,m} = \mathrm{TRB}\big(C_{part}[y]\big)_m$, where
+- **Parts** ($m=1..K$): $[V_\cdot]_{y,m} = \mathrm{TAB}\big(C_{part}[y]\big)_m$, where
   $C_{part} \in \mathbb{R}^{N_{id}\times K \cdot M_{ctx}\times 512}$ is a second learnable tensor
-  and $\mathrm{TRB}$ (TextRelationBlock, §3.5) is a bidirectional self-attention block run once per
+  and $\mathrm{TAB}$ (TextualAttentionBlock, §3.5) is a bidirectional self-attention block run once per
   identity, jointly over all $K$ part branches' context tokens, **before** any individual part's
   prompt is spliced together. This is the mechanism by which each part's prompt is informed by the
   other parts, rather than being learned in isolation.
 
-$C_{fg}$ and $C_{part}$ (together with TRB's attention weights) are the only trainable parameters
+$C_{fg}$ and $C_{part}$ (together with TAB's attention weights) are the only trainable parameters
 of this stage; the surrounding template tokens are frozen CLIP vocabulary embeddings shared across
 all identities and branches.
 
@@ -133,17 +133,17 @@ $g_\theta$'s weights ($\theta$) are never updated during any stage.
 
 On the visual side, the $K$ part embeddings $\{f_{i,1},\dots,f_{i,K}\}$ pooled by GWAP (§2.2) are
 likewise mixed once through a bidirectional self-attention block over the part axis —
-$\mathrm{VRB}$ (VisualRelationBlock, §3.5), a zero-initialized residual gate so it starts as an
+$\mathrm{VAB}$ (VisualAttentionBlock, §3.5), a zero-initialized residual gate so it starts as an
 identity map and only learns to mix as training progresses:
 
 $$
-\tilde f_{i,1..K} = f_{i,1..K} + \tanh(g)\cdot \mathrm{VRB}_{\mathrm{enc}}(f_{i,1..K}), \qquad g \in \mathbb{R}\ \text{learnable, } g_0 = 0
+\tilde f_{i,1..K} = f_{i,1..K} + \tanh(g)\cdot \mathrm{VAB}_{\mathrm{enc}}(f_{i,1..K}), \qquad g \in \mathbb{R}\ \text{learnable, } g_0 = 0
 $$
 
-The foreground embedding $f_{i,0}$ is left untouched by VRB (only the $K$ part branches are mixed;
+The foreground embedding $f_{i,0}$ is left untouched by VAB (only the $K$ part branches are mixed;
 see §3.5's rationale for excluding the foreground branch from both relation blocks).
 
-For a mini-batch of images, each branch's (possibly VRB-mixed) visual embedding is aligned against
+For a mini-batch of images, each branch's (possibly VAB-mixed) visual embedding is aligned against
 the corresponding identity's text embedding $\{t_{y_i,m}\}$ using a **multi-positive** supervised
 contrastive loss (not vanilla InfoNCE — every same-identity pair in the batch is a positive, not
 only the same-index pair), following the identity-mask formulation used in CLIP-ReID:
@@ -170,18 +170,18 @@ At the end of Stage 1, a frozen lookup table of per-identity, per-branch text pr
 $\bar{T} \in \mathbb{R}^{N_{id}\times M \times 512}$ is pre-computed once (via
 `examples/cache_text_anchors.py`, run once as a separate script after Stage 1 finishes — recomputing
 this deterministic, frozen forward pass on every Stage-2 step would be wasted work) and cached for
-Stage 2, which also loads VRB's Stage-1-trained weights as its own starting point (§4).
+Stage 2, which also loads VAB's Stage-1-trained weights as its own starting point (§4).
 
 ### 3.4 Algorithm 1 — Prompt Learning
 
 ```
 Input:  frozen visual encoder E_phi, frozen CLIP text encoder g_theta,
         raw training set D_raw = {(I_i, y_i)}, num identities N_id, K part branches
-Output: learned context (C_fg, C_part), trained VRB, TRB (TRB discarded after Stage 1)
+Output: learned context (C_fg, C_part), trained VAB, TAB (TAB discarded after Stage 1)
 
 1:  D <- filter_by_visibility(D_raw, E_phi, lambda_v_min)   # upstream accept/reject, see 3.5.2
 2:  Initialize C_fg ~ N(0, 0.02^2), C_part ~ N(0, 0.02^2)    # trainable, fp32
-3:  Initialize VRB (zero-init gate), TRB
+3:  Initialize VAB (zero-init gate), TAB
 4:  # Cache visual features once (no repeated encoder forward passes)
 5:  for each (I_i, y_i) in D:
 6:      (f_i, v_i) <- E_phi(I_i)                        # [M, D], [M], no_grad
@@ -189,12 +189,12 @@ Output: learned context (C_fg, C_part), trained VRB, TRB (TRB discarded after St
 8:  for epoch = 1 .. E1:
 9:      for each random mini-batch B of cached samples:
 10:         t_fg    <- g_theta(splice(C_fg[y]))          for y in B's labels
-11:         part_ctx <- TRB(C_part[y])                    for y in B's labels  # mix across K parts
+11:         part_ctx <- TAB(C_part[y])                    for y in B's labels  # mix across K parts
 12:         t_part[m] <- g_theta(splice(part_ctx[:, m]))  for m = 0..K-1
-13:         f_part <- VRB(f_{.,1..K})                     # mix visual K parts the same way
+13:         f_part <- VAB(f_{.,1..K})                     # mix visual K parts the same way
 14:         loss <- SupCon(f_{.,0}, t_fg) + sum_m SupCon(f_part[:,m], t_part[m])   # symmetric i2t+t2i, every branch, every sample
-15:         update (C_fg, C_part, VRB, TRB) by gradient descent on loss   # E_phi, g_theta frozen
-16: return (C_fg, C_part), VRB, TRB     # cache_text_anchors.py separately builds T_bar from these
+15:         update (C_fg, C_part, VAB, TAB) by gradient descent on loss   # E_phi, g_theta frozen
+16: return (C_fg, C_part), VAB, TAB     # cache_text_anchors.py separately builds T_bar from these
 ```
 
 ---
@@ -224,13 +224,13 @@ flowchart LR
     subgraph Visual side
         F["Backbone feature map F"] --> S["1x1 conv + softmax -> A_m"]
         S --> GWAP["GWAP pooling -> f_0 .. f_K"]
-        GWAP -- "f_1 .. f_K only" --> VRB["VisualRelationBlock"]
-        VRB --> Ftilde["mixed part embeddings"]
+        GWAP -- "f_1 .. f_K only" --> VAB["VisualAttentionBlock"]
+        VAB --> Ftilde["mixed part embeddings"]
     end
     subgraph Text side
         Cfg["C_fg[y]"] --> Splice0["splice into template"]
-        Cpart["C_part[y]"] --> TRB["TextRelationBlock"]
-        TRB --> SpliceM["splice each part's mixed context into template"]
+        Cpart["C_part[y]"] --> TAB["TextualAttentionBlock"]
+        TAB --> SpliceM["splice each part's mixed context into template"]
         Splice0 --> GTheta["frozen CLIP text transformer g_theta"]
         SpliceM --> GTheta
     end
@@ -243,7 +243,7 @@ unaddressed, and the two relation blocks close it independently on each side:
 
 - BPBreID's $K$ pooled part vectors $f_1,\dots,f_K$ (§2.2) are produced by $K$ independent
   weighted averages — there is no term anywhere in GWAP that lets "left arm" and "torso" influence
-  each other's pooled embedding. `VisualRelationBlock` (`pcr/models/relation_blocks.py`) adds one
+  each other's pooled embedding. `VisualAttentionBlock` (`pcr/models/relation_blocks.py`) adds one
   bidirectional `nn.TransformerEncoder` layer over the $K$ part tokens (batch dimension
   unaffected), so each part's final embedding can attend to every other part's, before either
   loss or distance computation sees it.
@@ -252,7 +252,7 @@ unaddressed, and the two relation blocks close it independently on each side:
   vice versa. Generalizing to $K$ separate part prompts compounds this: with no additional
   mechanism, each part's context tokens are optimized in complete isolation from every other
   part's — there is no path, causal or otherwise, for "person is carrying a bag" learned in one
-  part's context to inform another part's. `TextRelationBlock` runs *before* $g_\theta$, as a
+  part's context to inform another part's. `TextualAttentionBlock` runs *before* $g_\theta$, as a
   bidirectional pass over all $K$ parts' raw context tokens flattened together, so the causal
   encoder that follows starts from context that already reflects the other parts, rather than
   fixing the asymmetry after the fact.
@@ -260,9 +260,9 @@ unaddressed, and the two relation blocks close it independently on each side:
 Both blocks operate purely on the $K$ part branches' own representations (context vectors on the
 text side, pooled embeddings on the visual side) — never on $A_m$ itself, and never on the
 foreground branch (excluded per §0.1 of the design plan, which frames foreground inclusion as
-optional rather than the base case). `VisualRelationBlock` uses a learned, zero-initialized
+optional rather than the base case). `VisualAttentionBlock` uses a learned, zero-initialized
 residual gate ($\tanh(g)$, $g_0=0$) so training starts as if it were absent and only learns to mix
-if doing so helps; it remains active at inference. `TextRelationBlock` has no such gate — it is
+if doing so helps; it remains active at inference. `TextualAttentionBlock` has no such gate — it is
 owned internally by `PromptLearner`, trains only in Stage 1, and is discarded once $\bar T$ is
 cached (§3.3), so its output is baked into $\bar T$'s numbers rather than run again later.
 
@@ -270,15 +270,15 @@ cached (§3.3), so its output is baked into $\bar T$'s numbers rather than run a
 
 ```python
 # pcr/models/prompt_learner.py -- PromptLearner.build_part_prompts(labels)
-fg = self._splice(self.fg_ctx[labels])                 # foreground: untouched by TRB
+fg = self._splice(self.fg_ctx[labels])                 # foreground: untouched by TAB
 raw_part_ctx = self.part_ctx[labels]                    # [B, K*n_ctx, dim]
-mixed_part_ctx = self.trb(raw_part_ctx)                 # bidirectional mix across K parts
+mixed_part_ctx = self.tab(raw_part_ctx)                 # bidirectional mix across K parts
 parts = [self._splice(mixed_part_ctx[:, k*n_ctx:(k+1)*n_ctx, :]) for k in range(K)]
 return [fg] + parts                                      # M=1+K prompt tensors, one g_theta() call each
 ```
 
 ```python
-# pcr/models/relation_blocks.py -- VisualRelationBlock.forward(part_tokens)
+# pcr/models/relation_blocks.py -- VisualAttentionBlock.forward(part_tokens)
 relation_out = self.encoder(part_tokens)                 # bidirectional TransformerEncoder over K tokens
 return part_tokens + torch.tanh(self.gate) * relation_out # zero-init residual gate
 ```
@@ -307,7 +307,7 @@ sample admitted past this filter is treated as fully visible everywhere downstre
 
 Stage 2 trains the full visual encoder $E_\phi$ (backbone + attention head) with real identity
 labels. Stage 1's prompts and the CLIP text encoder are frozen; only $\bar{T}$ (as a fixed lookup
-table) is used, as the target of an alignment loss. `VisualRelationBlock` (§3.5) is the one
+table) is used, as the target of an alignment loss. `VisualAttentionBlock` (§3.5) is the one
 exception to "Stage 1 outputs are frozen here": it continues training jointly with $E_\phi$,
 initialized from Stage 1's weights, and its output — not the raw per-branch pooled embeddings —
 feeds all four loss terms below. As in Stage 1 (§3.5.2), the training set is filtered once
@@ -330,7 +330,7 @@ only; part branches are not separately classified.
 ### 4.2 Part-Triplet Loss
 
 A batch-hard triplet loss (Hermans et al., 2017), applied across **all** branches (foreground plus
-VRB-mixed parts) jointly. `pcr/loss/part_triplet_loss.py::PartTripletLoss` supports an optional
+VAB-mixed parts) jointly. `pcr/loss/part_triplet_loss.py::PartTripletLoss` supports an optional
 per-branch visibility weighting, but Stage 2 does not use it (`parts_visibility=None`) — since the
 upstream filter (§3.5.2) already guarantees every admitted sample has every branch usably visible,
 per-branch distances are combined by a plain unweighted average rather than the visibility-weighted
@@ -384,15 +384,15 @@ with defaults $\lambda_{id}=1.0,\ \lambda_{tri}=1.0,\ \lambda_{align}=0.5,\ \lam
 
 ```
 Input:  encoder E_phi (init. from ImageNet or an external checkpoint),
-        VRB (init. from Stage 1's trained weights), frozen prototype table T_bar,
+        VAB (init. from Stage 1's trained weights), frozen prototype table T_bar,
         raw labeled training set D_raw, identity classifier W_0
-Output: fine-tuned encoder E_phi*, continued-training VRB*
+Output: fine-tuned encoder E_phi*, continued-training VAB*
 
 1:  D <- filter_by_visibility(D_raw, E_phi, lambda_v_min)   # upstream accept/reject, see 3.5.2
 2:  for epoch = 1 .. E2:
 3:      for each PK-sampled mini-batch B (P identities x K instances) from D:
 4:          (f, v) <- E_phi(images(B))                       # [B, M, D], [B, M]
-5:          f_combined <- concat(f[:,0:1], VRB(f[:,1:]))      # foreground untouched, parts mixed
+5:          f_combined <- concat(f[:,0:1], VAB(f[:,1:]))      # foreground untouched, parts mixed
 6:          L_id  <- CrossEntropyLS(W_0 f_combined[:,0], y)
 7:          L_tri <- BatchHardTriplet(f_combined, y)          # unweighted average, no visibility arg
 8:          L_align <- 0
@@ -400,9 +400,9 @@ Output: fine-tuned encoder E_phi*, continued-training VRB*
 10:             L_align <- L_align + CrossEntropy(f_combined[:,m] . T_bar[:,m]^T, y)   # every branch, no skip
 11:         L_bpa <- BPA(S, mask_targets)   if masks available else 0
 12:         L <- lambda_id*L_id + lambda_tri*L_tri + lambda_align*L_align + lambda_bpa*L_bpa
-13:         update E_phi, VRB (and W_0) by gradient descent on L
+13:         update E_phi, VAB (and W_0) by gradient descent on L
 14:     evaluate mAP/CMC on the held-out query/gallery split
-15: return E_phi*, VRB*
+15: return E_phi*, VAB*
 ```
 
 ---

@@ -1,6 +1,6 @@
 """Upstream candidate-acceptance gate (reid_pipeline_plan.md's part-relational-attention addendum,
 section 0.1): rejects images whose body parts aren't reliably visible enough for
-VisualRelationBlock/TextRelationBlock's no-masking assumption to hold, *before* they ever reach
+VisualAttentionBlock/TextualAttentionBlock's no-masking assumption to hold, *before* they ever reach
 Stage 1 or Stage 2's training loop -- an explicit, logged, configurable filtering step (the
 threshold is a real argument here, not an unstated assumption baked into a dataset file somewhere
 no one remembers).

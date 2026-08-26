@@ -155,25 +155,6 @@ checkpoint and config unless already given explicitly. Omit `--stage1-config`/`-
 to skip those stages (e.g. to run Stage 3 alone against an externally-pretrained checkpoint);
 pass `--stage3 none` to stop after Stage 2.
 
-### Alternative: single-stage "generic CLIP" training (`train_relational_clip.py`)
-
-```bash
-python examples/train_relational_clip.py --config configs/relational_clip.yaml
-```
-
-Replaces Stage 1 + `cache_text_anchors.py` + Stage 2 with one combined stage: BPBreID's backbone
-+ BPA, `VisualAttentionBlock`, and `PromptLearner` (+ `TextualAttentionBlock`) all train jointly,
-every iteration, from fresh initialization (aside from the optional `model.checkpoint_path`, e.g.
-Stage 0's output) -- no frozen-backbone phase, no frozen-prompt phase, no precomputed
-text-prototype table. Uses the original CLIP paper's own contrastive loss
-(`pcr/loss/clip_contrastive_loss.py::ClipContrastiveLoss` -- diagonal symmetric cross-entropy with
-a learned temperature) instead of CLIP-ReID's two-stage SupCon-then-frozen-I2T scheme, combined
-with the same `PartTripletLoss` Stage 2 uses. No id or BPA loss. Batches are still PK-sampled
-(the triplet loss needs multiple instances per identity), which means other same-identity images
-within a batch are treated as negatives by the CLIP loss's diagonal-only assumption -- a known,
-accepted tradeoff of following the paper's own loss literally; see the loss file's own docstring.
-Saves a checkpoint in the same format as every other stage here, directly usable by Stage 3.
-
 ### Alternative: external BPBreID source pretraining
 
 Skipping Stages 1-2 entirely and pretraining with bpbreid's own pipeline instead is still

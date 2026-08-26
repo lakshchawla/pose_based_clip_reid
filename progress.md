@@ -1772,3 +1772,26 @@ bug in an earlier stage):
    all saved correctly.
 
 Full repo `python -m py_compile` sweep clean.
+
+---
+
+### 2026-08-26 03:35 — Removed `train_relational_clip.py` entirely, per direct user request
+
+The single-stage "generic CLIP" training approach added above (2026-08-26 03:15) underperformed
+the two-stage CLIP-ReID scheme in its own 1-epoch smoke test (0.7% mAP vs. Stage 2's 2.2% mAP).
+Discussed likely causes before any action, per the user's explicit request to wait: small batch
+size (8-32) starves the diagonal `ClipContrastiveLoss` of negatives, unlike `I2TLoss`'s full
+prototype-table comparison which is batch-size-independent; PK sampling (needed for the triplet
+loss this file also used) actively collides with the loss's diagonal-only positive assumption;
+and the file has no id loss at all, removing a strong, sample-efficient supervision signal Stage 2
+has. Both numbers were only 1-epoch smoke results, not converged, so the comparison itself was
+never meant to be conclusive either way.
+
+Decision after discussion: drop the whole approach rather than iterate on it. Deleted entirely:
+`examples/train_relational_clip.py`, `configs/relational_clip.yaml`,
+`pcr/loss/clip_contrastive_loss.py`; reverted `pcr/loss/__init__.py`'s `ClipContrastiveLoss`
+export; removed the README section describing it (a stale doc pointing at deleted files would be
+actively misleading, unlike this file's own historical record, which stays as-is above -- describing
+what was true when it was written, matching this file's established append-only convention).
+
+Full repo `python -m py_compile` sweep clean after removal.

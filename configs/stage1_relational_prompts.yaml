@@ -1,16 +1,20 @@
 # Stage 1: per-part CLIP prompt learning, with relational mixing across a person's K part
 # tokens on both sides -- TextualAttentionBlock (owned by PromptLearner) on the text side,
-# VisualAttentionBlock on the image side. BPBreID backbone and the CLIP text encoder are both
-# frozen; PromptLearner (incl. TextualAttentionBlock) and VisualAttentionBlock train. See
-# examples/train_relational_prompts.py. Run examples/cache_text_anchors.py against this same
-# config afterward to build Stage 2's frozen text-prototype table.
+# VisualAttentionBlock on the image side. BPBreID backbone, the CLIP text encoder, and the CLIP
+# image encoder are all frozen; only part_ctx (incl. TextualAttentionBlock) and
+# VisualAttentionBlock train -- see examples/train_relational_prompts.py's own docstring for the
+# full Algorithm 1 this file's script now follows exactly. Run examples/cache_text_anchors.py
+# against this same config afterward to build Stage 2's frozen text-prototype table.
 #
 # Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the tab:/vab:/
 # visibility: sections below are the new content relative to that file.
 
 model:
-  backbone: hrnet32          # or resnet50 -- must match --checkpoint-path if one is given
-  checkpoint_path: ''        # optional external bpbreid checkpoint; empty = ImageNet init
+  backbone: hrnet32          # or resnet50 -- must match Stage 0's own backbone
+  # Algorithm 1's own initialization step: load Stage 0's converged checkpoint, not ImageNet
+  # init -- run examples/train_bpa_segmentation.py first (configs/stage0_bpa_segmentation.yaml)
+  # to produce this file.
+  checkpoint_path: 'examples/logs/stage0_bpa/model_best.pth.tar'
   dim_reduce_output: 512     # must equal clip.arch's text embed dim (512 for ViT-B/32 and ViT-B/16)
   parts_num: 5                # K body parts; num_branches = 1 (foreground) + parts_num
 
@@ -38,7 +42,10 @@ data:
   data_dir: ../datasets
   height: 384
   width: 128
-  batch_size: 32               # random image sub-batch size per SupCon training step
+  batch_size: 32               # PK batch size per SupCon training step (must be a multiple of num_instances)
+  num_instances: 4             # PK sampling over the cached feature set: batch_size // num_instances
+                                # identities per batch, num_instances cached images each (with
+                                # replacement if an identity has fewer) -- Algorithm 1 step 6
   cache_batch_size: 32        # batch size for the one-off full-dataset feature-caching pass
   workers: 4
 

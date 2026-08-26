@@ -1,32 +1,60 @@
 """Stage 1: per-part CLIP prompt learning, with relational mixing across a person's K part
 tokens on both sides -- TextualAttentionBlock (owned by PromptLearner) on the text side,
-VisualAttentionBlock on the image side. Frozen BPBreID encoder + frozen CLIP text encoder; the
-only trainable things are PromptLearner (which includes TextualAttentionBlock as a submodule) and
-VisualAttentionBlock. Mirrors CLIP-ReID's own do_train_stage1
-(../CLIP-ReID/processor/processor_clipreid_stage1.py), generalized per-branch: the whole
-(visibility-filtered) training set's part-embeddings are cached once under no_grad, then every
-step draws a random image sub-batch (not PK-sampled -- matches the reference's plain
-shuffled-index sampling) and applies SupConLoss per branch, symmetrically (i2t + t2i).
+VisualAttentionBlock on the image side. Implements "Algorithm 1 -- Stage 1: Prompt + Relation
+Learning" exactly (see progress.md's entry on this file for the full step-by-step mapping);
+correspondence to that algorithm's own names:
 
-Two scope notes, both explicit decisions logged in progress.md, not defaults slipped in quietly:
-- No per-branch visibility gating inside the loss loop -- every branch contributes for every
-  cached sample, unconditionally. Reliability is handled once, upstream, by the visibility filter
-  below (pcr/utils/visibility_filter.py) rejecting whole images before caching, not by skipping
-  individual (sample, branch) pairs during training the way the pre-relational-attention version
-  of this file did.
-- VisualAttentionBlock and TextualAttentionBlock both operate on the K=5 part branches only. The
-  foreground/global branch (branch 0) keeps its own independent context and pooled feature,
-  untouched by either relation block -- see pcr/models/relation_blocks.py's module docstring.
+  Algorithm 1 name          This file / pcr/models
+  -----------------          -----------------------
+  backbone + BPAM            BPBReIDEncoder (frozen, loaded from Stage 0's checkpoint)
+  CLIP image encoder         ClipImageEncoder (frozen, loaded -- NOT consumed by this script's
+                              forward pass; BPBreID's backbone remains the sole visual encoder
+                              actually producing embeddings used in any loss here. Loaded/frozen
+                              only because Algorithm 1's own initialization step says to.)
+  CLIP text encoder          ClipTextEncoder (frozen)
+  ctx_params                 PromptLearner.part_ctx (K parts only -- PromptLearner also owns a
+                              separate fg_ctx for a foreground branch that Algorithm 1 does not
+                              use at all; this script trains part_ctx only, see below)
+  VRB                        VisualAttentionBlock (pcr/models/relation_blocks.py)
+  TRB                        TextualAttentionBlock (owned by PromptLearner, same file)
+  InfoNCE                    SupConLoss (pcr/loss/clip_supcon_loss.py) -- CLIP-ReID's real,
+                              multi-positive contrastive loss, not literal single-positive
+                              InfoNCE; kept as-is (not "fixed" to vanilla InfoNCE) since a plain-
+                              InfoNCE variant of this pipeline was already tried
+                              (train_relational_clip.py) and removed for underperforming, and
+                              Algorithm 1's own step 6 (PK sampling) only pays off with a
+                              multi-positive loss like SupCon in the first place -- see below.
 
-Renamed from train_prompts.py -- this is the file that changed for the part-relational-attention
-plan (see progress.md); train_finetune.py became train_relational_finetune.py for the same
-reason (Stage 2 also changed, to carry VisualAttentionBlock forward and drop visibility gating).
+Deliberately NOT in this script, matching Algorithm 1 exactly (steps 8, 15-16 extract BPAM's
+global/foreground feature f_g but never use it again, and the loss sum is over K parts only, no
+foreground term): no foreground contrastive loss, and PromptLearner.fg_ctx is excluded from this
+script's optimizer entirely -- it stays at its random initialization after Stage 1 runs. This
+leaves it meaningless for Stage 2's own foreground alignment term downstream; that inconsistency
+is a known, flagged consequence of scoping this fix to Stage 1 only, not something this file
+silently works around.
+
+Batches are genuinely PK-sampled from the cached feature set (build_pk_batches, below) --
+Algorithm 1 step 6, and not just a label change from the previous plain-random-sub-batch version:
+SupConLoss is a multi-positive loss, so PK sampling (guaranteeing multiple same-identity images
+per batch) is what makes its multi-positive design actually pay off, versus a plain random batch
+where most anchors have zero or one same-identity partner by chance.
+
+The whole (visibility-filtered) training set's part-embeddings are still cached once under
+no_grad before the training loop starts (BPBreID/BPAM are frozen throughout, so nothing about
+them changes step to step) -- PK batches are then drawn from indices into that cache, not by
+re-running the encoder.
+
+No per-branch visibility gating inside the loss loop -- every branch contributes for every cached
+sample, unconditionally, per reid_pipeline_plan.md's part-relational-attention addendum (section
+0.1). Reliability is handled once, upstream, by the visibility filter below
+(pcr/utils/visibility_filter.py) rejecting whole images before caching.
 
 Produces two files consumed by examples/cache_text_anchors.py (not by Stage 2 directly -- see
 that script's own docstring for why the final text-prototype computation is a separate step):
-prompt_learner.pth (PromptLearner's state, including TextualAttentionBlock) and vab.pth
-(VisualAttentionBlock's state -- unlike the text-side modules, VAB is *not* discarded after Stage
-1; Stage 2 loads vab.pth to continue training the same VisualAttentionBlock instance).
+prompt_learner.pth (PromptLearner's state, including TextualAttentionBlock and the untrained
+fg_ctx) and vab.pth (VisualAttentionBlock's state -- unlike the text-side modules, VAB is *not*
+discarded after Stage 1; Stage 2 loads vab.pth to continue training the same
+VisualAttentionBlock instance).
 
 Config-driven (YAML), not argparse -- see configs/stage1_relational_prompts.yaml. This is a
 deliberate deviation from the rest of pcr2 (train_uda.py/train_usl.py stay argparse-only, decided
@@ -46,6 +74,7 @@ from torch.utils.data import DataLoader
 
 from pcr import datasets
 from pcr.models.bpbreid_encoder import BPBReIDEncoder, BPBReIDModelCfg
+from pcr.models.clip_image_encoder import ClipImageEncoder
 from pcr.models.clip_text_encoder import ClipTextEncoder
 from pcr.models.prompt_learner import PromptLearner
 from pcr.models.relation_blocks import VisualAttentionBlock
@@ -90,6 +119,38 @@ def cache_part_features(encoder, data_loader):
     return torch.cat(features, 0), torch.cat(visibilities, 0), torch.cat(labels, 0)
 
 
+def build_pk_batches(cached_labels, num_instances, batch_size):
+    """Groups the cached feature set's indices by identity, then partitions all identities into
+    PK batches for one epoch: batch_size // num_instances identities per batch, num_instances
+    cached images per identity (sampled with replacement if that identity has fewer than
+    num_instances cached images). Algorithm 1 step 6 ("Sample a PK batch of pre-filtered
+    images") -- see this file's own module docstring for why this matters for SupConLoss
+    specifically, not just as a naming detail. A final partial group of identities (fewer than
+    batch_size // num_instances left over) is dropped, matching this repo's other PK
+    samplers' drop_last convention (pcr/utils/data/sampler.py::RandomIdentitySampler)."""
+    labels_np = cached_labels.cpu().numpy()
+    id_to_indices = {}
+    for idx, pid in enumerate(labels_np):
+        id_to_indices.setdefault(int(pid), []).append(idx)
+    pids = list(id_to_indices.keys())
+    random.shuffle(pids)
+
+    num_pids_per_batch = max(1, batch_size // num_instances)
+    batches = []
+    for start in range(0, len(pids), num_pids_per_batch):
+        batch_pids = pids[start:start + num_pids_per_batch]
+        if len(batch_pids) < num_pids_per_batch:
+            break
+        batch_idx = []
+        for pid in batch_pids:
+            pool = id_to_indices[pid]
+            replace = len(pool) < num_instances
+            chosen = np.random.choice(pool, size=num_instances, replace=replace)
+            batch_idx.extend(int(i) for i in chosen)
+        batches.append(torch.tensor(batch_idx, dtype=torch.long, device=cached_labels.device))
+    return batches
+
+
 def build_encoder(cfg):
     model_cfg = BPBReIDModelCfg(backbone=cfg.model.backbone)
     model_cfg.masks.parts_num = cfg.model.parts_num
@@ -131,6 +192,9 @@ def main_worker(cfg, setup_only=False):
 
     encoder = build_encoder(cfg)
     text_encoder = ClipTextEncoder(clip_arch=cfg.clip.arch, device='cuda').cuda()
+    # Loaded and frozen per Algorithm 1's own initialization step -- not consumed anywhere below;
+    # see this file's module docstring for why.
+    image_encoder = ClipImageEncoder(clip_arch=cfg.clip.arch, device='cuda').cuda()
     prompt_learner = PromptLearner(num_identities, num_parts, text_encoder, n_ctx=cfg.clip.n_ctx,
                                     tab_num_heads=cfg.tab.num_heads, tab_num_layers=cfg.tab.num_layers,
                                     device='cuda').cuda()
@@ -155,14 +219,18 @@ def main_worker(cfg, setup_only=False):
         num_images, num_identities, num_branches))
 
     if setup_only:
-        print('==> Setup complete: {} branches, {} cached images, fg_ctx shape {}, part_ctx '
-              'shape {}. Exiting before the training loop (--setup-only).'.format(
-                  num_branches, num_images, tuple(prompt_learner.fg_ctx.shape),
-                  tuple(prompt_learner.part_ctx.shape)))
+        print('==> Setup complete: {} branches, {} cached images, part_ctx shape {} (trainable), '
+              'fg_ctx shape {} (untrained -- see module docstring). Exiting before the training '
+              'loop (--setup-only).'.format(
+                  num_branches, num_images, tuple(prompt_learner.part_ctx.shape),
+                  tuple(prompt_learner.fg_ctx.shape)))
         return
 
     supcon = SupConLoss(temperature=cfg.loss.temperature).cuda()
-    trainable_params = list(prompt_learner.parameters()) + list(vab.parameters())
+    # fg_ctx deliberately excluded -- Algorithm 1 has no foreground term (see module docstring);
+    # only part_ctx, TextualAttentionBlock (prompt_learner.tab), and VisualAttentionBlock train.
+    trainable_params = ([prompt_learner.part_ctx] + list(prompt_learner.tab.parameters())
+                         + list(vab.parameters()))
     optimizer = torch.optim.Adam(trainable_params, lr=cfg.optim.lr,
                                   weight_decay=cfg.optim.weight_decay)
     scheduler = WarmupCosineLR(optimizer, max_epochs=cfg.optim.epochs,
@@ -177,30 +245,27 @@ def main_worker(cfg, setup_only=False):
     # (GradScaler is harmless for fp32 leaves), so one scaler covers everything trainable.
     scaler = torch.amp.GradScaler('cuda')
 
-    batch = cfg.data.batch_size
-    iters_per_epoch = max(1, num_images // batch)
-
     for epoch in range(cfg.optim.epochs):
         prompt_learner.train()
         vab.train()
         epoch_loss = 0.0
         epoch_start = time.time()
-        iter_list = torch.randperm(num_images, device='cuda')
+        # Algorithm 1 step 6: a fresh PK partition of the cached feature set every epoch, not a
+        # plain random sub-batch -- see build_pk_batches' and this file's own module docstring.
+        batches = build_pk_batches(cached_labels, cfg.data.num_instances, cfg.data.batch_size)
+        iters_per_epoch = len(batches)
 
-        for it in range(iters_per_epoch):
-            b_idx = iter_list[it * batch: (it + 1) * batch]
+        for it, b_idx in enumerate(batches):
             b_labels = cached_labels[b_idx]
             b_features = cached_features[b_idx]  # [b, 1+K, D], already L2-normalized per branch
 
             optimizer.zero_grad()
 
+            # Algorithm 1 steps 10-14: only the K part prompts are built and pushed through the
+            # frozen CLIP text encoder -- no foreground prompt/loss (module docstring).
             prompts = prompt_learner.build_part_prompts(b_labels)  # list of 1+K tensors
-            fg_text = text_encoder(prompts[0], prompt_learner.tokenized_prompts).float()
-            fg_visual = b_features[:, 0, :]
-            loss = supcon(fg_visual, fg_text, b_labels, b_labels) \
-                + supcon(fg_text, fg_visual, b_labels, b_labels)
-
             part_visual = vab(b_features[:, 1:, :])  # [b, K, D], relationally mixed
+            loss = b_features.new_zeros(())
             for k in range(num_parts):
                 part_text = text_encoder(prompts[1 + k], prompt_learner.tokenized_prompts).float()
                 visual_k = part_visual[:, k, :]

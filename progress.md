@@ -1823,3 +1823,66 @@ against the actual current configs that the new warning fires as expected (Stage
 together by default, matching the intentional, conservative design).
 
 Full repo `python -m py_compile` sweep clean.
+
+---
+
+### 2026-08-26 18:50 — Stage 1 rewritten to match "Algorithm 1 -- Stage 1: Prompt + Relation
+### Learning" exactly, after a line-by-line audit found five real discrepancies
+
+User supplied an explicit algorithm spec for Stage 1 and asked to verify `examples/
+train_relational_prompts.py` actually implements it. Audit found five discrepancies (reported
+first, fixed only after explicit confirmation to proceed):
+
+1. **CLIP image encoder never loaded.** Algorithm step 2 says to load and freeze a CLIP image
+   encoder; this repo's established design ("CLIP contributes only its frozen text tower") never
+   did. New -- `pcr/models/clip_image_encoder.py::ClipImageEncoder` -- loaded and frozen in Stage
+   1 (a second, independent `clip.load()` call, not shared with `ClipTextEncoder`) per the
+   algorithm's own initialization step, though not consumed by any loss: BPBreID's backbone
+   remains the sole visual encoder actually producing embeddings used anywhere in this pipeline.
+2. **Backbone/BPAM defaulted to ImageNet init, not Stage 0's checkpoint.**
+   `configs/stage1_relational_prompts.yaml`'s `model.checkpoint_path` now defaults to
+   `examples/logs/stage0_bpa/model_best.pth.tar` -- Stage 1 is no longer usable out of the box
+   without running Stage 0 first, matching the algorithm's own step 1 exactly.
+3. **Extra foreground/global loss term not in the algorithm.** The algorithm's `ctx_params` is a
+   single `(4K, embed_dim)` tensor (K parts only); it extracts BPAM's global feature `f_g` at step
+   8 but never uses it again, and the loss sum (steps 15-16) is over K parts only. Removed the
+   foreground `SupConLoss` term entirely from the training loop and excluded `PromptLearner.
+   fg_ctx` from Stage 1's optimizer -- `PromptLearner` itself is untouched (still owns `fg_ctx`,
+   still returns a foreground prompt from `build_part_prompts`), since `cache_text_anchors.py` and
+   Stage 2 both depend on that shape/API for their own foreground handling. Consequence, flagged
+   explicitly rather than silently absorbed: `fg_ctx` now stays at its random initialization after
+   Stage 1 runs, which makes Stage 2's foreground alignment term (I2TLoss against a prototype
+   built from untrained `fg_ctx`) meaningless until/unless that's addressed too -- out of today's
+   explicit scope ("fix it for relational prompts script").
+4. **Loss labeled "InfoNCE" in the algorithm, code uses `SupConLoss`.** Kept `SupConLoss`
+   (CLIP-ReID's real multi-positive contrastive loss) rather than switching to literal
+   single-positive InfoNCE -- a plain-InfoNCE variant of this whole pipeline was already tried
+   (`train_relational_clip.py`, 2026-08-26 03:15) and removed for underperforming
+   (2026-08-26 03:35). Interpreted "InfoNCE" in the algorithm as generic contrastive-loss
+   terminology, not a literal instruction to revert that decision.
+5. **Sampling wasn't PK.** Algorithm step 6 says "PK batch"; the code drew plain random
+   sub-batches from the cached feature set. New -- `build_pk_batches()` -- groups cached indices
+   by identity and partitions them into genuine PK batches every epoch (sampling with replacement
+   for identities with fewer than `num_instances` cached images), added `data.num_instances` to
+   `configs/stage1_relational_prompts.yaml`. This isn't just a naming fix: `SupConLoss` is a
+   multi-positive loss, so PK sampling (guaranteeing several same-identity images per batch) is
+   what actually lets its multi-positive design pay off, versus a plain random batch where most
+   anchors have zero or one same-identity partner by chance.
+
+**Verified with a real training run** (not `--setup-only` alone, per this session's established
+practice): using the already-verified Stage 0 checkpoint from the 2026-08-26 02:17 smoke run
+(`examples/logs/smoke_stage0/model_best.pth.tar`), a fresh 1-epoch smoke run completed cleanly --
+`ClipImageEncoder` loaded without error, Stage 0's checkpoint loaded correctly
+("Successfully loaded pretrained weights"), loss finite (~21.0, consistent with the foreground
+term's removal roughly halving the previous ~24-41 range), `VAB gate` moving from 0 as expected,
+`prompt_learner.pth`/`vab.pth` saved. Notably, the visibility filter now actually rejects images
+(kept 5041/12936, vs. 100% kept in every prior Stage 1 smoke test) -- because BPA is now genuinely
+segmentation-trained via Stage 0 rather than producing near-degenerate ImageNet-init attention, so
+the visibility-index threshold is doing real, meaningful filtering for the first time.
+
+Also noted, not touched (unrelated to this fix, not reverted per this session's own "don't touch
+what you don't understand" practice): `examples/train_bpa_segmentation.py` has an appended
+"SUGGESTED CHANGES" note (adding triplet/id loss + VAB to Stage 0) that appears to be the user's
+own note-to-self about a separate future change, left as-is.
+
+Full repo `python -m py_compile` sweep clean.

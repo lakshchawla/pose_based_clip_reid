@@ -173,3 +173,12 @@ def main_worker(cfg, setup_only=False):
 
 if __name__ == '__main__':
     main()
+
+
+
+"""
+SUGGESTED CHANGES:
+
+Train it similar to BPBREID, contrastively using all triplet loss, id loss, etc
+and VAB. 
+"""

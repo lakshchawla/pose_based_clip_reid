@@ -1,20 +1,23 @@
-"""Thin sequential orchestrator: Stage 1 (prompt learning) -> cache_text_anchors (build Stage 2's
-frozen alignment target from Stage 1's checkpoint) -> Stage 2 (backbone finetune) -> Stage 3 (UDA
-or USL domain adaptation, user-selected) -> eval, per reid_pipeline_plan.md section 6. Each stage
-script already evaluates internally at the end of its own run (via pcr/evaluators.py::Evaluator),
-so no separate eval step exists here -- "eval" in the plan's own section 6 is what Stage 3
-already does.
+"""Thin sequential orchestrator: Stage 0 (optional BPA segmentation pretraining) -> Stage 1
+(prompt learning) -> cache_text_anchors (build Stage 2's frozen alignment target from Stage 1's
+checkpoint) -> Stage 2 (backbone finetune) -> Stage 3 (UDA or USL domain adaptation, user-selected)
+-> eval, per reid_pipeline_plan.md section 6. Each stage script already evaluates internally at
+the end of its own run (via pcr/evaluators.py::Evaluator), so no separate eval step exists here --
+"eval" in the plan's own section 6 is what Stage 3 already does.
 
 Shells out to each stage's own script as a separate process rather than importing them as library
-functions -- train_relational_prompts.py/cache_text_anchors.py/train_relational_finetune.py/
-train_uda.py/train_usl.py are all `if __name__ == '__main__':`-driven scripts with process-global
-state (stdout redirection via Logger, CUDA context, argparse), never designed to be called twice
-in one Python process. This file's only real job: run the selected stages in order, stop on the
-first failure, and compute the one piece of information that crosses the YAML/argparse boundary
-between Stage 2 and Stage 3 -- the checkpoint path Stage 2 wrote, which Stage 3's
---checkpoint-path needs. Everything else is passed straight through to whichever scripts run;
-Stage 1 -> cache_text_anchors -> Stage 2 wiring needs no such help since it's already
-config-file-driven (all three read/write the same stage1 logs_dir).
+functions -- train_bpa_segmentation.py/train_relational_prompts.py/cache_text_anchors.py/
+train_relational_finetune.py/train_uda.py/train_usl.py are all `if __name__ == '__main__':`-driven
+scripts with process-global state (stdout redirection via Logger, CUDA context, argparse), never
+designed to be called twice in one Python process. This file's only real job: run the selected
+stages in order, stop on the first failure, and compute the one piece of information that crosses
+the YAML/argparse boundary between Stage 2 and Stage 3 -- the checkpoint path Stage 2 wrote, which
+Stage 3's --checkpoint-path needs. Everything else is passed straight through to whichever scripts
+run; Stage 0 -> Stage 1 -> cache_text_anchors -> Stage 2 wiring needs no such help since it's
+already config-file-driven -- this script only checks that Stage 0's expected checkpoint path
+matches Stage 1's model.checkpoint_path (a warning, like the existing Stage1/Stage2 logs_dir
+check, not an auto-rewrite of either config) rather than actually injecting one config's output
+path into the next.
 """
 from __future__ import print_function, absolute_import
 import argparse
@@ -27,6 +30,7 @@ import yaml
 
 EXAMPLES_DIR = osp.dirname(osp.abspath(__file__))
 STAGE_SCRIPTS = {
+    'bpa': osp.join(EXAMPLES_DIR, 'train_bpa_segmentation.py'),
     'prompts': osp.join(EXAMPLES_DIR, 'train_relational_prompts.py'),
     'cache_anchors': osp.join(EXAMPLES_DIR, 'cache_text_anchors.py'),
     'finetune': osp.join(EXAMPLES_DIR, 'train_relational_finetune.py'),
@@ -55,13 +59,19 @@ def run(cmd):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PCR pipeline orchestrator: Stage 1 (prompts) -> Stage 2 (finetune) -> "
-                    "Stage 3 (UDA or USL). Any argument this parser doesn't recognize is passed "
+        description="PCR pipeline orchestrator: Stage 0 (BPA segmentation, optional) -> Stage 1 "
+                    "(prompts) -> Stage 2 (finetune) -> Stage 3 (UDA or USL). Any argument this "
+                    "parser doesn't recognize is passed "
                     "straight through to the Stage 3 script (train_uda.py/train_usl.py) -- e.g. "
                     "`run_pipeline.py --stage3 uda -ds market1501 -dt dukemtmc-reid`. Do not use "
                     "a `--` separator before the pass-through args: argparse.parse_known_args() "
                     "does not strip it, and the Stage 3 script's own parser -- with no positional "
                     "arguments of its own -- rejects a literal '--' as an unrecognized argument.")
+    parser.add_argument('--stage0-config', type=str, default=None, metavar='PATH',
+                         help="configs/stage0_bpa_segmentation.yaml-style path; omit to skip "
+                              "Stage 0 (optional -- most runs start from Stage 1's ImageNet init "
+                              "instead). Requires a dataset with masks on disk (Market1501); "
+                              "see examples/train_bpa_segmentation.py.")
     parser.add_argument('--stage1-config', type=str, default=None, metavar='PATH',
                          help="configs/stage1_relational_prompts.yaml-style path; omit to skip "
                               "Stage 1 and cache_text_anchors.py (e.g. prompt learning was "
@@ -75,6 +85,16 @@ def main():
                          help="python interpreter to invoke each stage script with")
     args, stage3_extra_args = parser.parse_known_args()
 
+    if args.stage0_config and args.stage1_config:
+        stage0_out = osp.join(load_yaml(args.stage0_config)['logging']['logs_dir'], 'model_best.pth.tar')
+        stage1_checkpoint = load_yaml(args.stage1_config)['model']['checkpoint_path']
+        if osp.normpath(stage0_out) != osp.normpath(stage1_checkpoint or ''):
+            print("==> WARNING: stage0 config's expected checkpoint output ({}) does not match "
+                  "stage1 config's model.checkpoint_path ({}) -- Stage 1 will not load the "
+                  "checkpoint this run of Stage 0 is about to produce (empty means ImageNet init "
+                  "instead). Continuing anyway (not a hard error, in case this is "
+                  "intentional).".format(stage0_out, stage1_checkpoint or '<empty>'))
+
     if args.stage1_config and args.stage2_config:
         stage1_out = load_yaml(args.stage1_config)['logging']['logs_dir']
         stage2_in = load_yaml(args.stage2_config)['stage1']['prompt_dir']
@@ -83,6 +103,11 @@ def main():
                   "config's stage1.prompt_dir ({}) -- Stage 2 will not read the "
                   "text_prototypes.pth this run of Stage 1 is about to produce. Continuing "
                   "anyway (not a hard error, in case this is intentional).".format(stage1_out, stage2_in))
+
+    if args.stage0_config:
+        run([args.python, STAGE_SCRIPTS['bpa'], '--config', args.stage0_config])
+    else:
+        print('==> Skipping Stage 0 (no --stage0-config given)')
 
     if args.stage1_config:
         run([args.python, STAGE_SCRIPTS['prompts'], '--config', args.stage1_config])

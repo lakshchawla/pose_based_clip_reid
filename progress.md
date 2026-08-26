@@ -1795,3 +1795,31 @@ actively misleading, unlike this file's own historical record, which stays as-is
 what was true when it was written, matching this file's established append-only convention).
 
 Full repo `python -m py_compile` sweep clean after removal.
+
+---
+
+### 2026-08-26 03:50 — Portable data_dir across machines; Stage 0 wired into run_pipeline.py
+
+**Machine-portability fix**: `configs/stage0_bpa_segmentation.yaml`, `stage1_relational_prompts.yaml`,
+and `stage2_relational_finetune.yaml` all hardcoded `data.data_dir` as an absolute path under this
+machine's own home directory (`/home/lakshh/workspace/reid/datasets`), which breaks when testing on
+a second machine with the same relative directory layout but a different username. Changed all
+three to `../datasets` -- resolves identically regardless of username, since `data_dir` is already
+used via plain `osp.join()` with no anchoring (so it's implicitly resolved relative to the process's
+own working directory), and every documented usage in this repo runs each script from the repo
+root already.
+
+**`examples/run_pipeline.py`**: exposed Stage 0 (`train_bpa_segmentation.py`) as `--stage0-config`,
+run before Stage 1 if given (optional -- most runs still start from Stage 1's ImageNet init).
+Added a config-consistency warning matching the existing Stage1/Stage2 `logs_dir` check: if
+`--stage0-config` and `--stage1-config` are both given but Stage 1's `model.checkpoint_path`
+doesn't already point at Stage 0's expected `<logs_dir>/model_best.pth.tar`, this script warns
+rather than silently rewriting either YAML file -- same "check and warn, don't auto-inject"
+philosophy the Stage1->Stage2 handoff already uses (per this file's own docstring, Stage0->Stage1
+is config-file-driven, same as Stage1->Stage2, unlike the Stage2->Stage3 handoff, which genuinely
+needs help since Stage 3 is argparse-only). Verified: `--help` output correct, and confirmed
+against the actual current configs that the new warning fires as expected (Stage 0's log dir
+`examples/logs/stage0_bpa` vs. Stage 1's currently-empty `checkpoint_path` -- they're not wired
+together by default, matching the intentional, conservative design).
+
+Full repo `python -m py_compile` sweep clean.

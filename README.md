@@ -141,6 +141,7 @@ since its pseudo-label numbering changes every epoch).
 
 ```bash
 python examples/run_pipeline.py \
+    --stage0-config configs/stage0_bpa_segmentation.yaml \
     --stage1-config configs/stage1_relational_prompts.yaml \
     --stage2-config configs/stage2_relational_finetune.yaml \
     --stage3 uda \
@@ -148,12 +149,17 @@ python examples/run_pipeline.py \
 ```
 
 Runs the selected stages in order (Stage 1 automatically triggers `cache_text_anchors.py`
-afterward, against the same `--stage1-config`), stopping on the first failure. Any argument this
-script doesn't recognize (like `-ds`/`-dt`/`--data-dir`/`--logs-dir` above) is passed straight
-through to the Stage 3 script; `--checkpoint-path`/`--backbone` are auto-filled from Stage 2's
-checkpoint and config unless already given explicitly. Omit `--stage1-config`/`--stage2-config`
-to skip those stages (e.g. to run Stage 3 alone against an externally-pretrained checkpoint);
-pass `--stage3 none` to stop after Stage 2.
+afterward, against the same `--stage1-config`), stopping on the first failure. `--stage0-config`
+is optional (most runs start from Stage 1's ImageNet init instead) -- unlike the Stage2->Stage3
+handoff below, Stage 0's checkpoint is *not* auto-filled into Stage 1's config; if
+`--stage0-config` and `--stage1-config` are both given but Stage 1's own `model.checkpoint_path`
+doesn't already point at Stage 0's expected output, this script only warns (matching the
+Stage1/Stage2 `logs_dir` consistency check), it doesn't rewrite either YAML file for you. Any
+argument this script doesn't recognize (like `-ds`/`-dt`/`--data-dir`/`--logs-dir` above) is passed
+straight through to the Stage 3 script; `--checkpoint-path`/`--backbone` are auto-filled from
+Stage 2's checkpoint and config unless already given explicitly. Omit `--stage0-config`/
+`--stage1-config`/`--stage2-config` to skip those stages (e.g. to run Stage 3 alone against an
+externally-pretrained checkpoint); pass `--stage3 none` to stop after Stage 2.
 
 ### Alternative: external BPBreID source pretraining
 

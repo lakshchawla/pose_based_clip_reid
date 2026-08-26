@@ -18,7 +18,7 @@ model:
 
 data:
   dataset: market1501         # DukeMTMC-reID has no masks on disk -- market1501 only
-  data_dir: /home/lakshh/workspace/reid/datasets
+  data_dir: ../datasets
   height: 384
   width: 128
   batch_size: 32

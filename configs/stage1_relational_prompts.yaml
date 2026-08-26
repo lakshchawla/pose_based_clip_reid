@@ -35,7 +35,7 @@ visibility:
 
 data:
   dataset: market1501         # or dukemtmc-reid
-  data_dir: /home/lakshh/workspace/reid/datasets
+  data_dir: ../datasets
   height: 384
   width: 128
   batch_size: 32               # random image sub-batch size per SupCon training step

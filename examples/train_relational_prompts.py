@@ -17,13 +17,18 @@ correspondence to that algorithm's own names:
                               use at all; this script trains part_ctx only, see below)
   VRB                        VisualAttentionBlock (pcr/models/relation_blocks.py)
   TRB                        TextualAttentionBlock (owned by PromptLearner, same file)
-  InfoNCE                    SupConLoss (pcr/loss/clip_supcon_loss.py) -- CLIP-ReID's real,
-                              multi-positive contrastive loss, not literal single-positive
-                              InfoNCE; kept as-is (not "fixed" to vanilla InfoNCE) since a plain-
-                              InfoNCE variant of this pipeline was already tried
-                              (train_relational_clip.py) and removed for underperforming, and
-                              Algorithm 1's own step 6 (PK sampling) only pays off with a
-                              multi-positive loss like SupCon in the first place -- see below.
+  InfoNCE                    InfoNCELoss (pcr/loss/clip_infonce_loss.py) -- literal single-
+                              positive InfoNCE, matching the algorithm's own step 15 wording,
+                              replacing the earlier `SupConLoss` (CLIP-ReID's multi-positive
+                              contrastive loss, removed -- this was its only caller). Per direct
+                              user request. Naive diagonal InfoNCE over a raw PK-sampled batch
+                              would reproduce the exact collision that made the earlier
+                              train_relational_clip.py underperform (same-identity images treated
+                              as false negatives) -- InfoNCELoss avoids this by deduplicating to
+                              unique identities before building the negative set on both
+                              directions; see that file's own docstring for the full mechanism.
+                              Temperature is a fixed constant (0.07 by default, CLIP's own
+                              established optimal starting value), not learned.
 
 Deliberately NOT in this script, matching Algorithm 1 exactly (steps 8, 15-16 extract BPAM's
 global/foreground feature f_g but never use it again, and the loss sum is over K parts only, no
@@ -35,9 +40,10 @@ silently works around.
 
 Batches are genuinely PK-sampled from the cached feature set (build_pk_batches, below) --
 Algorithm 1 step 6, and not just a label change from the previous plain-random-sub-batch version:
-SupConLoss is a multi-positive loss, so PK sampling (guaranteeing multiple same-identity images
-per batch) is what makes its multi-positive design actually pay off, versus a plain random batch
-where most anchors have zero or one same-identity partner by chance.
+even with InfoNCELoss's per-identity deduplication making it safe against PK-batch collisions,
+PK sampling still means every anchor is far more likely to share its batch with useful additional
+signal (other views of related identities feeding the same TAB/VAB mixing step) than a plain
+random batch would give -- and matches Algorithm 1's own step 6 regardless of loss-type specifics.
 
 The whole (visibility-filtered) training set's part-embeddings are still cached once under
 no_grad before the training loop starts (BPBreID/BPAM are frozen throughout, so nothing about
@@ -78,7 +84,7 @@ from pcr.models.clip_image_encoder import ClipImageEncoder
 from pcr.models.clip_text_encoder import ClipTextEncoder
 from pcr.models.prompt_learner import PromptLearner
 from pcr.models.relation_blocks import VisualAttentionBlock
-from pcr.loss.clip_supcon_loss import SupConLoss
+from pcr.loss.clip_infonce_loss import InfoNCELoss
 from pcr.utils.config import load_yaml_config
 from pcr.utils.data import transforms as T
 from pcr.utils.data.preprocessor import Preprocessor
@@ -124,9 +130,10 @@ def build_pk_batches(cached_labels, num_instances, batch_size):
     PK batches for one epoch: batch_size // num_instances identities per batch, num_instances
     cached images per identity (sampled with replacement if that identity has fewer than
     num_instances cached images). Algorithm 1 step 6 ("Sample a PK batch of pre-filtered
-    images") -- see this file's own module docstring for why this matters for SupConLoss
-    specifically, not just as a naming detail. A final partial group of identities (fewer than
-    batch_size // num_instances left over) is dropped, matching this repo's other PK
+    images") -- see this file's own module docstring for why this matters even with InfoNCELoss's
+    per-identity deduplication making it safe against PK-batch collisions. A final partial group
+    of identities (fewer than batch_size // num_instances left over) is dropped, matching this
+    repo's other PK
     samplers' drop_last convention (pcr/utils/data/sampler.py::RandomIdentitySampler)."""
     labels_np = cached_labels.cpu().numpy()
     id_to_indices = {}
@@ -226,7 +233,7 @@ def main_worker(cfg, setup_only=False):
                   tuple(prompt_learner.fg_ctx.shape)))
         return
 
-    supcon = SupConLoss(temperature=cfg.loss.temperature).cuda()
+    infonce = InfoNCELoss(temperature=cfg.loss.temperature).cuda()
     # fg_ctx deliberately excluded -- Algorithm 1 has no foreground term (see module docstring);
     # only part_ctx, TextualAttentionBlock (prompt_learner.tab), and VisualAttentionBlock train.
     trainable_params = ([prompt_learner.part_ctx] + list(prompt_learner.tab.parameters())
@@ -269,8 +276,7 @@ def main_worker(cfg, setup_only=False):
             for k in range(num_parts):
                 part_text = text_encoder(prompts[1 + k], prompt_learner.tokenized_prompts).float()
                 visual_k = part_visual[:, k, :]
-                loss = loss + supcon(visual_k, part_text, b_labels, b_labels) \
-                    + supcon(part_text, visual_k, b_labels, b_labels)
+                loss = loss + infonce(visual_k, part_text, b_labels)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)

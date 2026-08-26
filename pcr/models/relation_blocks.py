@@ -19,6 +19,7 @@ own independent prompt, unmixed, exactly as before this file existed.
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class VisualAttentionBlock(nn.Module):
@@ -32,6 +33,17 @@ class VisualAttentionBlock(nn.Module):
     doubles as a training-stability/interpretability device: the converged value of
     `torch.tanh(self.gate)` is a direct read on how much relational mixing training actually
     found useful for this run -- a gate that stays near 0 is a real (negative) result, not a bug.
+
+    Output is L2-normalized before returning (see changes.md's now-resolved entry on this): the
+    residual sum above can drift away from unit norm as the gate moves off zero, but every
+    consumer of this output (InfoNCELoss in Stage 1, PartTripletLoss/CosineAlignLoss in Stage 2)
+    computes similarity assuming unit-normalized inputs -- matching BPBreIDEncoder's own
+    foreground/global embedding, which is already normalized before this block ever sees the part
+    embeddings. Normalizing here, once, means every caller gets a consistent invariant rather than
+    each loss call site needing to remember it separately. Doesn't change the zero-init no-op
+    property: at gate=0 this returns `normalize(part_tokens)`, and `part_tokens` arrives already
+    unit-normalized from BPBreIDEncoder, so it's a true no-op (up to floating-point precision),
+    not just an approximate one.
     """
 
     def __init__(self, dim, num_heads=4, num_layers=1, ff_dim=None):
@@ -46,9 +58,10 @@ class VisualAttentionBlock(nn.Module):
 
     def forward(self, part_tokens):
         """part_tokens: [B, K, C] pooled part features (K=5 parts, not including foreground).
-        Returns [B, K, C], same shape, relationally mixed."""
+        Returns [B, K, C], same shape, relationally mixed and L2-normalized."""
         relation_out = self.encoder(part_tokens)
-        return part_tokens + torch.tanh(self.gate) * relation_out
+        mixed = part_tokens + torch.tanh(self.gate) * relation_out
+        return F.normalize(mixed, p=2, dim=-1)
 
 
 class TextualAttentionBlock(nn.Module):

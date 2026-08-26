@@ -7,37 +7,16 @@ still pending).
 
 ## Changes to be done
 
-### 1. Stage 1's per-part loss: symmetric (i2t + t2i) vs. the algorithm's literal single-direction InfoNCE
+### 1. Stage 1's per-part loss is still symmetric (i2t + t2i), now via `InfoNCELoss`
 
-`examples/train_relational_prompts.py`'s per-part loss (lines ~270-273) computes `SupConLoss`
-symmetrically for each part k:
-
-```python
-loss = loss + supcon(visual_k, part_text, b_labels, b_labels) \
-    + supcon(part_text, visual_k, b_labels, b_labels)
-```
-
-"Algorithm 1 -- Stage 1: Prompt + Relation Learning" (as supplied) step 15 specifies one direction
-only: `InfoNCE(relation_feats[:,k], t_i^k)`. The symmetric version is CLIP-ReID's own established
-convention (and this repo's file docstring already documents it as a deliberate, ported choice),
-so it wasn't changed during the 2026-08-26 Algorithm-1 rewrite -- but it is a real deviation from
+`SupConLoss` has been replaced with `pcr/loss/clip_infonce_loss.py::InfoNCELoss` (per direct user
+request), resolving the loss-*type* half of what this entry used to flag. The loss is still
+computed symmetrically internally (`InfoNCELoss.forward` returns `loss_i2t + loss_t2i`), while
+"Algorithm 1"'s own step 15 specifies one direction only (`InfoNCE(relation_feats[:,k], t_i^k)`).
+Kept symmetric since that wasn't part of the loss-type request and matches this repo's established
+convention (CLIP-ReID/CLIP's own symmetric training loop) -- but it's still a real deviation from
 the algorithm's literal wording, doubling the number of loss terms per part (2 instead of 1).
 
-**Decision needed**: keep symmetric (current behavior, matches CLIP-ReID/CLIP's own convention),
-or switch to single-direction only (visual->text) to match the algorithm literally.
+**Decision needed**: keep symmetric (current behavior), or switch to single-direction only
+(visual->text) to match the algorithm literally.
 
-### 2. (Minor, pre-existing, lower priority) `VisualAttentionBlock`'s output isn't renormalized before `SupConLoss`
-
-`VisualAttentionBlock.forward` returns `part_tokens + tanh(gate) * relation_out` -- a residual sum
-that can drift away from unit norm as `gate` moves off zero during training. `SupConLoss` computes
-raw dot-product logits scaled by a fixed `temperature=1.0`, implicitly assuming its inputs are
-already close to unit-normalized (a true cosine similarity). This predates the Algorithm-1 rewrite
-(not introduced by it) and the algorithm text doesn't specify normalization either way, so it's
-not a strict violation -- just a place where the loss's temperature calibration could quietly
-drift as training progresses.
-
-**Decision needed**: leave as-is (consistent with how `CosineAlignLoss`/other losses in this repo
-already treat VAB's output, per `train_relational_finetune.py`'s identical pattern -- notably,
-`CosineAlignLoss` itself is scale-invariant since cosine similarity ignores norm, so this concern
-is really only about `SupConLoss`'s raw dot-product logits), or add an explicit `F.normalize` on
-the visual side before `SupConLoss` in Stage 1 (and/or Stage 2).

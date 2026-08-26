@@ -1959,3 +1959,49 @@ was loaded back and directly inspected -- contains `['state_dict', 'vab_state_di
 top-5 14.9%, top-10 21.3% (consistent with prior 1-epoch smoke-scale numbers).
 
 Full repo `python -m py_compile` sweep clean.
+
+---
+
+### 2026-08-26 20:05 — `SupConLoss` replaced with literal `InfoNCELoss` in Stage 1;
+### `VisualAttentionBlock`'s output now L2-normalized
+
+**Loss swap, per direct user request**: `pcr/loss/clip_supcon_loss.py::SupConLoss` (CLIP-ReID's
+multi-positive contrastive loss) removed entirely (its only caller) and replaced with new --
+`pcr/loss/clip_infonce_loss.py::InfoNCELoss` -- literal single-positive InfoNCE, matching
+"Algorithm 1"'s own step 15 wording. Confirmed with the user before implementing: naive diagonal
+InfoNCE over a raw PK-sampled batch would reproduce the exact same-identity-as-false-negative
+collision that made the earlier `train_relational_clip.py` underperform (removed 2026-08-26
+03:35) -- resolved by deduplicating to unique identities before building the negative set on
+*both* the i2t direction (every image classified against the batch's unique identities' text
+anchors -- duplicate rows simply share the same correct target, not a collision) and the t2i
+direction (one representative image per identity, keeping it single-positive there too).
+Temperature is a fixed constant, not learned -- defaults to 0.07, CLIP's own established optimal
+starting value (`configs/stage1_relational_prompts.yaml`, replacing SupConLoss's old
+temperature=1.0, which was tuned for that loss's different, multi-positive formulation).
+`examples/train_relational_prompts.py` updated: one `infonce(visual_k, part_text, b_labels)` call
+per part instead of two swapped `supcon(...)` calls (symmetry is now internal to `InfoNCELoss`
+itself).
+
+**Normalization fix, resolving `changes.md`'s tracked entry**: `VisualAttentionBlock.forward` now
+L2-normalizes its output (`pcr/models/relation_blocks.py`) before returning, rather than leaving
+the residual sum (`part_tokens + tanh(gate) * relation_out`) free to drift off unit norm as the
+gate trains away from zero. Every consumer of this output (`InfoNCELoss` in Stage 1;
+`PartTripletLoss` and `CosineAlignLoss` in Stage 2) implicitly assumes unit-normalized inputs for
+its similarity computation to behave as intended, matching `BPBreIDEncoder`'s own foreground/
+global embedding, which was already normalized before ever reaching this block. Normalizing
+inside the block itself (rather than at each of the three call sites) means the invariant holds
+everywhere by construction. Verified the zero-init no-op property survives: at `gate=0` this
+reduces to `normalize(part_tokens)`, and `part_tokens` already arrives unit-normalized from
+`BPBreIDEncoder`, so it's a true no-op (not merely close to one). As a side effect, Stage 2's
+`combined` tensor (foreground + VAB-mixed parts) is now uniformly unit-normalized across every
+branch, closing a previously-existing inconsistency where only the foreground branch was.
+
+`changes.md` updated: its normalization entry (item 2) is removed, resolved by this change. Its
+other entry (item 1, symmetric-vs-single-direction InfoNCE) is untouched and still open -- this
+fix was about normalization only, not loss direction.
+
+Full repo `python -m py_compile` sweep clean. Not yet re-verified with a real training run (the
+dev GPU is currently occupied by the user's own `init.ipynb` notebook kernel; they opted to skip
+the smoke test for now rather than free it up) -- treat this as compile-checked only until a real
+Stage 1 run confirms `InfoNCELoss` and the normalized `VisualAttentionBlock` output behave as
+expected together.

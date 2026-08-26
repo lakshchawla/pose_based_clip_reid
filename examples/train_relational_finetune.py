@@ -1,45 +1,56 @@
-"""Stage 2: supervised backbone finetune. BPBreID backbone + attention are trainable; Stage 1's
-learned prompts and the CLIP text encoder are both frozen -- only Stage 1's precomputed
-text_prototypes.pth (a frozen per-(identity,branch) lookup table, built by
-examples/cache_text_anchors.py) is used here, as the alignment loss's fixed target.
-VisualAttentionBlock, by contrast, is *not* frozen: it was trainable in Stage 1 too (with the
-backbone frozen there), and this script loads its Stage-1 weights (vab.pth) as a starting point
-and keeps training it jointly with the now-unfrozen backbone -- it is a permanent part of the
-visual pipeline, not training-only scaffolding the way PromptLearner/TextualAttentionBlock are.
+"""Stage 2: supervised backbone finetune, implementing "Algorithm 2 -- Stage 2: Backbone
+Fine-Tuning" exactly (see progress.md's entry on this file for the full step-by-step mapping);
+correspondence to that algorithm's own names:
 
-Combines four losses, matching reid_pipeline_plan.md section 3.2 generalized per-branch and
-CLIP-ReID's actual stage-2 formula (loss/make_loss.py) for the alignment term:
+  Algorithm 2 name           This file / pcr/models
+  -----------------          -----------------------
+  backbone + BPAM             BPBReIDEncoder, now trainable, initialized from Stage 0's converged
+                               checkpoint (the SAME one Stage 1 used going in, since Stage 1 never
+                               updates it -- see configs/stage2_relational_finetune.yaml)
+  VRB                         VisualAttentionBlock, now trainable, initialized from vab.pth
+                               (Stage 1's trained starting point, read from stage1.prompt_dir)
+  frozen_text_anchors          text_prototypes.pth (built by examples/cache_text_anchors.py),
+                               loaded once; ctx_params/TRB/CLIP text encoder are never loaded
+                               here at all -- nothing to "discard", they simply aren't imported
+  global ID classifier         PartIdClassifiers (foreground/branch-0 only)
+  L_id_global                  id_loss (CrossEntropyLabelSmooth) on the global classifier's logits
+  L_tri_global + L_tri_parts    two separate PartTripletLoss calls, NOT one fused call across all
+                               branches -- see compute_losses' own comments for why this matters
+  L_align                      CosineAlignLoss (pcr/loss/clip_cosine_align_loss.py) -- literal
+                               1-cosine_sim per part against that identity's frozen anchor, NOT
+                               CLIP-ReID's I2TLoss (removed: this was its only caller), which was
+                               a full cross-entropy classification against the whole prototype
+                               table. Parts only (branches 1..K) -- no foreground/global alignment
+                               term at all, matching Stage 1's own scope (fg_ctx is never trained
+                               there, so a foreground anchor would be meaningless noise; see
+                               changes.md's now-resolved entry on this).
+  L_attn                       BodyPartAttentionLoss, mandatory by default now (data.masks_dir
+                               defaults to Market1501's real masks, matching Algorithm 2's own
+                               unconditional framing) but still optional in code for datasets with
+                               no masks on disk (dukemtmc-reid) -- see the config's own comment.
 
-  - id loss (foreground branch only, matching bpbreid's own default_losses_weights convention
-    already documented in pcr/loss/gilt_loss.py): CrossEntropyLabelSmooth via a persistent
-    PartIdClassifiers head (real, static labels here -- not per-epoch cluster centers, unlike the
-    USL path, since Stage 2 has real identity labels throughout). Foreground is untouched by
-    VisualAttentionBlock (see pcr/models/relation_blocks.py), so this term is unchanged from
-    before this file gained VAB.
-  - triplet loss (all branches -- foreground plus VAB-mixed parts): pcr/loss/part_triplet_loss.py
-    ::PartTripletLoss.
-  - alignment loss (all branches): pcr/loss/clip_i2t_loss.py::I2TLoss against Stage 1's frozen
-    per-branch text prototypes.
-  - BPA loss (optional, source-domain masks only): pcr/loss/body_part_attention_loss.py, off by
-    default (data.masks_dir empty in the YAML). Operates on pixels_cls_scores (a spatial map),
-    entirely separate from the pooled features VAB touches -- unaffected by this file's changes.
+Loss combination in compute_losses() matches Algorithm 2 step 16 exactly: L_attn + L_id_global +
+L_tri_global + L_tri_parts + lambda_clip * L_align, where lambda_clip is cfg.loss.align_weight --
+the one term the algorithm gives its own explicit coefficient; every other term uses an implicit
+weight of 1 in the algorithm's own formula, which this file's id_weight/triplet_weight/bpa_weight
+config knobs default to (kept configurable rather than hardcoded to 1, since every other stage in
+this repo already exposes its loss weights the same way).
 
-Scope note, an explicit decision logged in progress.md, not a default slipped in quietly: no
-per-branch visibility gating in the triplet or alignment loss loops -- every branch contributes
+No per-branch visibility gating anywhere in these loss computations -- every branch contributes
 for every sample, unconditionally, matching reid_pipeline_plan.md's part-relational-attention
 addendum (section 0.1). Reliability is handled once, upstream, by the same visibility filter
 Stage 1 uses (pcr/utils/visibility_filter.py), applied to this stage's own training set before
 the first epoch.
 
-Renamed from train_finetune.py -- paired with train_relational_prompts.py's rename, since this
-file changed substantively too (VAB, dropped visibility gating, the upstream filter), unlike a
-plain rename with no functional change.
+End-of-training checkpoint (Algorithm 2 step 20) bundles VisualAttentionBlock's state into the
+SAME saved dict as the encoder's own state ('vab_state_dict' alongside 'state_dict'), rather than
+a separate vab.pth -- one checkpoint containing {backbone, BPAM, VRB}, directly loadable by the
+existing examples/train_uda.py --checkpoint-path / examples/train_usl.py --checkpoint-path
+unchanged (both only ever read the 'state_dict' key, ignoring the rest -- confirmed against
+bpbreid's own load_pretrained_weights). Stage 3 stays completely out of this file's scope
+otherwise; nothing downstream reads 'vab_state_dict' yet.
 
-Produces a checkpoint of just the BPBreID model's own state dict (not the whole encoder wrapper),
-directly loadable by the existing examples/train_uda.py --checkpoint-path or
-examples/train_usl.py --checkpoint-path unchanged -- Stage 3 stays completely out of this file's
-scope, VisualAttentionBlock's own weights are saved separately and nothing downstream reads them
-yet.
+Renamed from train_finetune.py -- paired with train_relational_prompts.py's rename.
 
 Config-driven (YAML) -- see configs/stage2_relational_finetune.yaml. Same deliberate deviation
 from the rest of pcr2 as examples/train_relational_prompts.py (train_uda.py/train_usl.py stay
@@ -62,7 +73,7 @@ from pcr import datasets
 from pcr.models.bpbreid_encoder import BPBReIDEncoder, BPBReIDModelCfg
 from pcr.models.id_classifier import PartIdClassifiers
 from pcr.models.relation_blocks import VisualAttentionBlock
-from pcr.loss import PartTripletLoss, CrossEntropyLabelSmooth, I2TLoss, BodyPartAttentionLoss
+from pcr.loss import PartTripletLoss, CrossEntropyLabelSmooth, CosineAlignLoss, BodyPartAttentionLoss
 from pcr.evaluators import Evaluator
 from pcr.utils.config import load_yaml_config
 from pcr.utils.data import IterLoader
@@ -161,33 +172,55 @@ def compute_losses(encoder, vab, id_classifiers, triplet_loss, id_loss, align_lo
     # VAB existed.
     relation_parts = vab(f_out[:, 1:, :])  # [B, K, D]
     combined = torch.cat([f_out[:, 0:1, :], relation_parts], dim=1)  # [B, 1+K, D]
+    num_branches = combined.size(1)
 
     total = f_out.new_zeros(())
     log = {}
 
+    # Algorithm 2 step 10: L_id_global, the global classifier's cross-entropy on f_g alone.
     id_logits = id_classifiers(combined, 0)
     l_id = id_loss(id_logits, targets)
     total = total + cfg.loss.id_weight * l_id
     log['id'] = l_id.item()
 
-    # no parts_visibility argument -- every branch contributes for every sample unconditionally,
-    # per reid_pipeline_plan.md's part-relational-attention addendum section 0.1; reliability is
-    # handled once, upstream, by the visibility filter applied to the training set before this
-    # loop ever runs, not by masking individual (sample, branch) pairs here
-    result = triplet_loss(combined, targets)
-    if result is not None:
-        l_tri = result[0]
-        total = total + cfg.loss.triplet_weight * l_tri
-        log['triplet'] = l_tri.item()
+    # Algorithm 2 steps 11-13: L_tri_global (batch-hard triplet on f_g alone) and L_tri_parts (K
+    # separate per-part batch-hard triplet losses, summed) -- two independent computations, not
+    # one triplet loss fused across all M branches' distances the way this loop used to call
+    # PartTripletLoss once on `combined` directly. Calling PartTripletLoss with a single-branch
+    # slice ([B, 1, D]) gives that branch's own, unfused batch-hard mining -- no parts_visibility
+    # argument anywhere here either way, per reid_pipeline_plan.md's part-relational-attention
+    # addendum section 0.1 (every branch contributes for every sample unconditionally; reliability
+    # is handled once, upstream, by the visibility filter applied to the training set).
+    global_result = triplet_loss(combined[:, 0:1, :], targets)
+    if global_result is not None:
+        l_tri_global = global_result[0]
+        total = total + cfg.loss.triplet_weight * l_tri_global
+        log['tri_global'] = l_tri_global.item()
 
-    num_branches = combined.size(1)
+    l_tri_parts = f_out.new_zeros(())
+    for branch in range(1, num_branches):
+        part_result = triplet_loss(combined[:, branch:branch + 1, :], targets)
+        if part_result is not None:
+            l_tri_parts = l_tri_parts + part_result[0]
+    total = total + cfg.loss.triplet_weight * l_tri_parts
+    log['tri_parts'] = l_tri_parts.item()
+
+    # Algorithm 2 steps 14-15: L_align, 1-cosine_sim per part against that identity's frozen text
+    # anchor, summed over the K PART branches only -- no foreground/global alignment term at all,
+    # matching Stage 1's own scope exactly (fg_ctx is never trained there -- see progress.md's
+    # entry on that rewrite -- so text_prototypes[:, 0, :] is meaningless noise; excluding branch 0
+    # here means that noise is never actually used for anything, resolving changes.md's flagged
+    # consequence as a side effect of matching Algorithm 2's own scope, not a separate workaround).
     align_total = f_out.new_zeros(())
-    for branch in range(num_branches):
-        branch_prototypes = text_prototypes[:, branch, :]
-        align_total = align_total + align_loss(combined[:, branch, :], branch_prototypes, targets)
+    for branch in range(1, num_branches):
+        branch_anchors = text_prototypes[targets, branch, :]  # [B, D], gathered per sample's own identity
+        align_total = align_total + align_loss(combined[:, branch, :], branch_anchors)
     total = total + cfg.loss.align_weight * align_total
     log['align'] = align_total.item()
 
+    # Algorithm 2 steps 9/16: L_attn, mandatory whenever masks are configured (see
+    # configs/stage2_relational_finetune.yaml's own comment on why this defaults on now, and why
+    # it still needs to stay optional in code for mask-less datasets like dukemtmc-reid).
     if use_masks:
         mask_targets = mask_to_pixel_targets(mask.cuda(), pixels_cls_scores)
         l_bpa, _ = bpa_loss(pixels_cls_scores, mask_targets)
@@ -246,7 +279,7 @@ def main_worker(cfg, setup_only=False):
 
     triplet_loss = PartTripletLoss(margin=cfg.loss.triplet_margin).cuda()
     id_loss = CrossEntropyLabelSmooth(num_identities).cuda()
-    align_loss = I2TLoss(num_identities).cuda()
+    align_loss = CosineAlignLoss().cuda()
     use_masks = bool(cfg.data.masks_dir)
     bpa_loss = BodyPartAttentionLoss().cuda() if use_masks else None
 
@@ -320,19 +353,19 @@ def main_worker(cfg, setup_only=False):
             mAP = float(evaluator.evaluate(test_loader, dataset.query, dataset.gallery, cmc_flag=False))
             is_best = mAP > best_mAP
             best_mAP = max(mAP, best_mAP)
+            # Algorithm 2 step 20: one saved checkpoint containing {backbone, BPAM, VRB} -- 'vab_
+            # state_dict' rides alongside 'state_dict' in the same file rather than a separate
+            # vab.pth, harmless to any consumer reading only 'state_dict' (bpbreid's own
+            # load_pretrained_weights explicitly reads that one key and ignores the rest).
             save_checkpoint({
                 'state_dict': encoder.model.state_dict(),
+                'vab_state_dict': vab.state_dict(),
                 'epoch': epoch + 1,
                 'best_mAP': best_mAP,
                 'optimizer': optimizer.state_dict(),
             }, is_best, fpath=osp.join(cfg.logging.logs_dir, 'checkpoint.pth.tar'))
             print('\n * Finished epoch {:3d}  model mAP: {:5.1%}  best: {:5.1%}{}\n'.format(
                 epoch, mAP, best_mAP, ' *' if is_best else ''))
-
-    torch.save(vab.state_dict(), osp.join(cfg.logging.logs_dir, 'vab.pth'))
-    print('==> Saved Stage-2-trained VisualAttentionBlock weights to {} (not consumed by anything '
-          'downstream yet -- Stage 3 is out of scope for this change)'.format(
-              osp.join(cfg.logging.logs_dir, 'vab.pth')))
 
     print('==> Test with the best model:')
     best_fpath = osp.join(cfg.logging.logs_dir, 'model_best.pth.tar')

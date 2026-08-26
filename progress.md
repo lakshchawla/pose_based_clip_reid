@@ -1886,3 +1886,76 @@ what you don't understand" practice): `examples/train_bpa_segmentation.py` has a
 own note-to-self about a separate future change, left as-is.
 
 Full repo `python -m py_compile` sweep clean.
+
+---
+
+### 2026-08-26 19:36 — Stage 2 rewritten to match "Algorithm 2: Backbone Fine-Tuning" exactly,
+### after a line-by-line audit found five real discrepancies
+
+Same audit discipline as the Stage 1 rewrite above: read `examples/train_relational_finetune.py`
+and its actual loss implementations (not just the docstrings) against a user-supplied algorithm
+spec. Batching itself was already correct (`RandomIdentitySampler` + `IterLoader`, genuine PK
+sampling, unlike Stage 1's pre-rewrite issue). Five discrepancies found, all fixed after
+confirmation:
+
+1. **Stage 0 checkpoint not loaded by default.** `configs/stage2_relational_finetune.yaml`'s
+   `model.checkpoint_path` now defaults to `examples/logs/stage0_bpa/model_best.pth.tar` -- the
+   same checkpoint Stage 1 uses going in (Stage 1 never updates it, so it's genuinely the same
+   weights, not a separate lineage), matching the algorithm's own step 1.
+2. **L_attn (BPA loss) was optional and off by default; the algorithm treats it as mandatory.**
+   Judgment call, made explicitly rather than blind literal compliance: even though Stage 0
+   already trains BPAM via this exact mask supervision, Stage 2 goes on to update backbone+BPAM
+   further via id/triplet/align gradients that know nothing about real part boundaries -- keeping
+   L_attn active during Stage 2 is what stops that continued training from drifting BPAM's
+   attention away from the real, mask-anchored split Stage 0 established. `data.masks_dir` now
+   defaults to Market1501's real `pifpaf_maskrcnn_filtering` (matching Stage 0's own default),
+   while staying fully optional in code for mask-less datasets (dukemtmc-reid). "Pseudo
+   part-parsing labels" in the algorithm's own wording read as these same ground-truth-derived
+   pixel targets, not a separate self-generated pseudo-labeling scheme this repo doesn't have.
+3. **Triplet loss was one fused computation across all branches; the algorithm wants three
+   separate ones.** `compute_losses` used to call `PartTripletLoss(combined, targets)` once,
+   which (confirmed by reading `part_triplet_loss.py` directly) averages every branch's distance
+   matrix into one fused metric before a single batch-hard mining pass -- architecturally
+   different from independent global/part triplet losses (a hard negative under the fused metric
+   isn't necessarily the hardest negative for any single branch). Fixed by calling the same
+   `PartTripletLoss` twice differently instead of writing a new loss class: once on
+   `combined[:, 0:1, :]` alone (`l_tri_global`), and once per part branch summed
+   (`l_tri_parts`) -- passing a single-branch `[B, 1, D]` slice makes `PartTripletLoss`'s internal
+   per-branch averaging a no-op, giving that branch's own unfused batch-hard loss for free, no new
+   class needed. Both terms share the existing `cfg.loss.triplet_weight`, matching the algorithm's
+   own formula (step 16), which weights every term but `L_align` implicitly at 1.
+4. **Alignment loss: wrong formula and wrong scope.** Algorithm step 14:
+   `1 - cosine_sim(relation_feats[:,k], frozen_text_anchors[label,k])`, parts only. Code used
+   `I2TLoss` -- confirmed (by rereading that file) to be full label-smoothed cross-entropy against
+   the *entire* prototype table, not a pairwise cosine term -- summed over all `1+K` branches
+   including foreground. New -- `pcr/loss/clip_cosine_align_loss.py::CosineAlignLoss` -- a direct
+   per-sample `1 - cosine_similarity` against a pre-gathered anchor (`text_prototypes[targets, k,
+   :]`), restricted to branches `1..K` only. `I2TLoss` deleted entirely (`pcr/loss/
+   clip_i2t_loss.py`) -- this was its only caller repo-wide. Excluding foreground from alignment
+   also resolves `changes.md`'s previously-flagged consequence of Stage 1's own rewrite (fg_ctx is
+   untrained there, so `text_prototypes[:, 0, :]` was meaningless noise) -- that noise is now
+   simply never read, as a direct side effect of matching Algorithm 2's own scope rather than a
+   separate patch. `changes.md` updated: that entry removed (resolved), and its item 3's now-stale
+   `I2TLoss` reference fixed to `CosineAlignLoss` -- worth noting `CosineAlignLoss` is
+   scale-invariant (cosine similarity ignores norm), so the VAB-output-normalization concern in
+   that remaining entry only actually applies to `SupConLoss` (Stage 1), not this loss.
+5. **Final checkpoint was two separate files; the algorithm wants one.** Step 20: "save {backbone,
+   BPAM, VRB}" as one checkpoint. `vab.pth` was a separate `torch.save` call; now
+   `vab_state_dict` rides inside the same `checkpoint.pth.tar`/`model_best.pth.tar` dict alongside
+   `state_dict` -- confirmed safe by reading `torchreid.utils.load_pretrained_weights` directly
+   (it reads only the `state_dict` key, ignoring the rest), so `train_uda.py`/`train_usl.py
+   --checkpoint-path` need no changes. The separate `vab.pth` save was removed.
+
+**Verified with a real training run** (not `--setup-only` alone): built `text_prototypes.pth` from
+the existing Stage 1 smoke checkpoint (`examples/logs/smoke_stage1_algo1`, via
+`cache_text_anchors.py`, not previously run against that output), then a fresh 1-epoch Stage 2
+smoke run against Stage 0's and Stage 1's existing smoke checkpoints. Completed cleanly: `tri_
+global`/`tri_parts` appear as genuinely separate finite values (e.g. 0.366 / 2.110, not one fused
+`triplet` term); `align` values (~1.7-2.25) are an order of magnitude smaller than the old
+`I2TLoss` cross-entropy values (~39-40), as expected for a bounded `[0,2]`-per-term cosine loss;
+`bpa` appears in every logged iteration now that masks default on; the saved `model_best.pth.tar`
+was loaded back and directly inspected -- contains `['state_dict', 'vab_state_dict', 'epoch',
+'best_mAP', 'optimizer']`, no separate `vab.pth` on disk. Full run: Mean AP 2.4%, top-1 5.7%,
+top-5 14.9%, top-10 21.3% (consistent with prior 1-epoch smoke-scale numbers).
+
+Full repo `python -m py_compile` sweep clean.

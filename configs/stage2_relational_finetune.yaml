@@ -1,7 +1,11 @@
-# Stage 2: supervised backbone finetune. BPBreID backbone + attention are trainable; Stage 1's
-# prompts/CLIP text encoder are frozen (Stage 1's frozen text-prototype table is loaded from
-# stage1.prompt_dir, not recomputed here). VisualAttentionBlock is *not* frozen -- it continues
-# training here, starting from Stage 1's weights (also read from stage1.prompt_dir). See
+# Stage 2: supervised backbone finetune, implementing "Algorithm 2 -- Stage 2: Backbone
+# Fine-Tuning" exactly (see progress.md's entry on this file for the full step-by-step mapping).
+# BPBreID backbone + BPAM are trainable, initialized from Stage 0's converged checkpoint (the same
+# one Stage 1 used, frozen, as its own starting point -- Stage 1 never updates it, so this is
+# genuinely "the same weights", not a separate lineage). Stage 1's prompts/CLIP text encoder are
+# frozen and never loaded here at all (only the frozen text_prototypes.pth table they produced is
+# read, from stage1.prompt_dir). VisualAttentionBlock is *not* frozen -- it continues training
+# here, starting from Stage 1's weights (also read from stage1.prompt_dir). See
 # examples/train_relational_finetune.py.
 #
 # Renamed from stage2_backbone_finetune.yaml -- pairs with the renamed script; the vab:/
@@ -9,9 +13,10 @@
 
 model:
   backbone: hrnet32          # must match stage1's model.backbone -- see stage1.prompt_dir note below
-  checkpoint_path: ''        # should match stage1's model.checkpoint_path, so this stage starts
-                              # finetuning from the same point stage1's prompts were trained
-                              # against; empty = ImageNet init
+  # Algorithm 2's own initialization step: load the SAME Stage 0 checkpoint Stage 1 used going in
+  # (Stage 1 never updates backbone/BPAM, so this is that exact checkpoint, not a separate one) --
+  # not ImageNet init, and not Stage 1's own output (Stage 1 produces no encoder checkpoint at all).
+  checkpoint_path: 'examples/logs/stage0_bpa/model_best.pth.tar'
   dim_reduce_output: 512
   parts_num: 5
 
@@ -38,15 +43,30 @@ data:
   batch_size: 32
   num_instances: 4             # PK sampling: batch_size // num_instances identities per batch
   workers: 4
-  masks_dir: ''                 # e.g. 'pifpaf_maskrcnn_filtering'; empty = BPA loss off (market1501
-                                 # has masks on disk, dukemtmc-reid does not, per progress.md)
+  # Algorithm 2 step 9/16 treats L_attn (the BPA/pixel-supervision loss below) as mandatory, not
+  # optional -- default to Market1501's real masks (matching Stage 0's own default) rather than
+  # empty, so it's on by default. Judgment call, not blind literal compliance: even though Stage 0
+  # already trains BPAM via this exact supervision, Stage 2 goes on to update backbone+BPAM
+  # further via id/triplet/align gradients that know nothing about real part boundaries -- keeping
+  # L_attn active here is what stops that continued training from drifting BPAM's attention away
+  # from the real, mask-anchored split Stage 0 established, not a redundant repeat of Stage 0's
+  # job. "Pseudo part-parsing labels" in Algorithm 2's own wording is read as these same
+  # ground-truth-derived pixel targets (the only such labels this repo has), not a separate
+  # self-generated pseudo-labeling scheme. Set to '' to disable (e.g. training on dukemtmc-reid,
+  # which has no masks on disk, per progress.md) -- BPA loss stays fully optional in the code for
+  # exactly that case, this default just makes the intended, mask-available path match Algorithm
+  # 2 out of the box.
+  masks_dir: pifpaf_maskrcnn_filtering
   masks_suffix: '.npy'
 
 loss:
   id_weight: 1.0
+  # Algorithm 2's own loss formula (step 16) sums L_tri_global and L_tri_parts with equal,
+  # implicit weight -- both use this same triplet_weight rather than two separate knobs.
   triplet_weight: 1.0
   triplet_margin: 0.3
-  align_weight: 0.5
+  align_weight: 0.5             # lambda_clip in Algorithm 2's own notation -- the one term the
+                                 # algorithm itself gives an explicit, separate coefficient
   bpa_weight: 0.35                   # only used when data.masks_dir is set; bpbreid's own yaml default
 
 optim:

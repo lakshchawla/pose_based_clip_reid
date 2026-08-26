@@ -6,7 +6,7 @@ from .part_triplet_loss import PartTripletLoss
 from .gilt_loss import PartGiLtLoss
 from .body_part_attention_loss import BodyPartAttentionLoss
 from .clip_supcon_loss import SupConLoss
-from .clip_i2t_loss import I2TLoss
+from .clip_cosine_align_loss import CosineAlignLoss
 
 __all__ = [
     'PartViewContrastiveLoss',
@@ -15,5 +15,5 @@ __all__ = [
     'PartGiLtLoss',
     'BodyPartAttentionLoss',
     'SupConLoss',
-    'I2TLoss',
+    'CosineAlignLoss',
 ]

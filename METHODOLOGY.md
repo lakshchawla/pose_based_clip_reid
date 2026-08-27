@@ -179,7 +179,7 @@ Input:  frozen visual encoder E_phi, frozen CLIP text encoder g_theta,
         raw training set D_raw = {(I_i, y_i)}, num identities N_id, K part branches
 Output: learned context (C_fg, C_part), trained VAB, TAB (TAB discarded after Stage 1)
 
-1:  D <- filter_by_visibility(D_raw, E_phi, lambda_v_min)   # upstream accept/reject, see 3.5.2
+1:  D <- D_raw   # no upstream filtering -- every image used, weighted per-branch in the loss (3.5.2)
 2:  Initialize C_fg ~ N(0, 0.02^2), C_part ~ N(0, 0.02^2)    # trainable, fp32
 3:  Initialize VAB (zero-init gate), TAB
 4:  # Cache visual features once (no repeated encoder forward passes)
@@ -283,23 +283,34 @@ relation_out = self.encoder(part_tokens)                 # bidirectional Transfo
 return part_tokens + torch.tanh(self.gate) * relation_out # zero-init residual gate
 ```
 
-#### 3.5.2 Upstream Visibility Filtering (Replaces Per-Branch Masking)
+#### 3.5.2 Per-Branch Visibility Weighting (Revised — Replaces the Earlier Upstream Filter)
 
-Because occlusion handling is out of scope for this design (images are assumed pre-filtered, not
-robustly handled end-to-end), neither relation block nor either stage's loss does any per-sample,
-per-branch masking. Instead, `pcr/utils/visibility_filter.py::filter_by_visibility` computes a
-scalar visibility index per image — the mean of BPBreID's own part-visibility scores $v_1,\dots,v_K$
-(§2.3), excluding the foreground branch — and rejects any image below a threshold
-$\lambda_{v\_min}$ *before* Stage 1's feature cache or Stage 2's training loader is built:
+An earlier revision of this design rejected whole images upstream, before Stage 1's feature cache
+or Stage 2's training loader was ever built, using a scalar mean-visibility-per-image threshold.
+That mechanism was removed: it discarded 61% of Market1501's training images in practice, was the
+wrong granularity (a single occluded part dragged down an otherwise-fully-visible image's mean,
+discarding every good part along with it), and its rejections were found to be driven by an
+undertrained BPAM (one part branch reading as permanently invisible dataset-wide, another as
+visible almost unconditionally — a training-collapse signature, not real occlusion).
+
+Every image is now used, with no upstream exclusion of any kind. Reliability is handled instead by
+*weighting* each branch's own loss contribution by that branch's own per-image visibility score
+$v_m(I) \in [0,1]$ (continuous, not the binary scores §2.3 describes as the default — Stage 1/2's
+own encoder construction switches to continuous scores specifically for this):
 
 $$
-\mathrm{VisIndex}(I) = \frac{1}{K}\sum_{m=1}^{K} v_m(I), \qquad \text{keep } I \iff \mathrm{VisIndex}(I) \ge \lambda_{v\_min}
+\mathcal{L}^{(m)}_{\text{weighted}} = \frac{\sum_i w_{i,m}\, \ell^{(m)}_i}{\sum_i w_{i,m}}, \qquad w_{i,m} = \max(v_m(I_i),\, \epsilon)
 $$
 
-This is a strictly simpler mechanism than the branch-conditional masking used elsewhere in the
-repo's other stages (`pcr/loss/gilt_loss.py`'s GiLt split, Stage 3's visibility-gated distance in
-§5): rather than every loss term needing to know which branches are usable for which sample, every
-sample admitted past this filter is treated as fully visible everywhere downstream.
+applied to Stage 1's `InfoNCELoss` and Stage 2's `CosineAlignLoss` (both per-part, per-sample
+terms — $\epsilon=10^{-3}$ floors every sample's weight so none is ever exactly excluded). Stage
+2's triplet loss is the one exception: batch-hard mining's max/min operations don't compose with
+soft weights, so it keeps a loose *hard* exclusion via `PartTripletLoss`'s own `parts_visibility`
+argument, thresholded at $\lambda_{\text{tri}}=0.05$ — deliberately far looser than the removed
+filter's $\lambda_{v\_min}=0.5$, meant only to drop true degenerate branches, not gate whole
+images. `VisualAttentionBlock`/`TextualAttentionBlock` themselves still perform no masking of any
+kind (§3.5's own description of both blocks is unchanged) — a tracked, deliberate scope limit, not
+addressed by this revision.
 
 ---
 
@@ -388,7 +399,7 @@ Input:  encoder E_phi (init. from ImageNet or an external checkpoint),
         raw labeled training set D_raw, identity classifier W_0
 Output: fine-tuned encoder E_phi*, continued-training VAB*
 
-1:  D <- filter_by_visibility(D_raw, E_phi, lambda_v_min)   # upstream accept/reject, see 3.5.2
+1:  D <- D_raw   # no upstream filtering -- every image used, weighted per-branch in the loss (3.5.2)
 2:  for epoch = 1 .. E2:
 3:      for each PK-sampled mini-batch B (P identities x K instances) from D:
 4:          (f, v) <- E_phi(images(B))                       # [B, M, D], [B, M]

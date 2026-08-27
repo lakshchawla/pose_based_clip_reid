@@ -6,8 +6,10 @@
 # full Algorithm 1 this file's script now follows exactly. Run examples/cache_text_anchors.py
 # against this same config afterward to build Stage 2's frozen text-prototype table.
 #
-# Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the tab:/vab:/
-# visibility: sections below are the new content relative to that file.
+# Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the tab:/vab:
+# sections below are the new content relative to that file. No visibility: section -- the
+# upstream image-level filter this used to configure was removed (see progress.md's entry on
+# this); every image is used, weighted per-part inside InfoNCELoss instead.
 
 model:
   backbone: hrnet32          # or resnet50 -- must match Stage 0's own backbone
@@ -29,13 +31,6 @@ tab:
 vab:
   num_heads: 4                 # VisualAttentionBlock's attention heads, over the K part branches
   num_layers: 1                # start shallow -- see progress.md for the ablation this should feed
-
-visibility:
-  # upstream candidate-acceptance gate (reid_pipeline_plan.md's part-relational-attention
-  # addendum, section 0.1): images whose mean part-visibility falls below this are rejected
-  # before caching/training ever sees them -- see pcr/utils/visibility_filter.py for the exact
-  # definition. 0.0 effectively disables filtering (every image passes).
-  lambda_v_min: 0.5
 
 data:
   dataset: market1501         # or dukemtmc-reid

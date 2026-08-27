@@ -3,12 +3,18 @@ visual side (VisualAttentionBlock, over BPAM's pooled part features) and the tex
 (TextualAttentionBlock, over PromptLearner's per-part learnable context tokens) -- see
 progress.md's entry on this change for the full design rationale.
 
-Neither block masks anything: this plan's operating assumption (see reid_pipeline_plan.md's
-part-relational-attention addendum, section 0.1) is that low-visibility images are filtered out
-upstream (pcr/utils/visibility_filter.py) before they ever reach either block, so every one of
-the K part tokens handed to either block is assumed reliably present. That is a real, stated
-assumption, not something these two classes verify themselves -- they always run "as if" every
-part is visible.
+Neither block masks anything, and unlike this plan's original operating assumption, that is no
+longer because low-visibility images are filtered out upstream -- that upstream image-level
+filter (pcr/utils/visibility_filter.py) has been removed entirely (see progress.md's entry on the
+visibility-filter-to-weighting refactor): every image, including fully-occluded ones, now reaches
+both blocks unfiltered. Reliability is instead handled downstream, inside Stage 1/2's own loss
+functions (InfoNCELoss, CosineAlignLoss, PartTripletLoss), which weight or loosely exclude a
+poorly-visible part's own *loss contribution*. Neither block here does anything analogous itself
+-- a genuinely-occluded part's near-garbage pooled feature still gets blended, at full and equal
+weight, into every other part's post-attention representation via this block's own self-attention,
+before any loss ever sees a token or gets a chance to discount it. This is a deliberate, tracked
+scope limit (see changes.md), not an oversight: fixing it would mean threading per-branch
+visibility into this block's own attention computation, which is out of scope for now.
 
 Only foreground/global stays outside both blocks entirely, in this build: relational mixing
 covers the K=5 part branches (branches 1..K in BPBreIDEncoder's convention), not the foreground

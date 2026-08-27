@@ -45,15 +45,34 @@ PK sampling still means every anchor is far more likely to share its batch with 
 signal (other views of related identities feeding the same TAB/VAB mixing step) than a plain
 random batch would give -- and matches Algorithm 1's own step 6 regardless of loss-type specifics.
 
-The whole (visibility-filtered) training set's part-embeddings are still cached once under
-no_grad before the training loop starts (BPBreID/BPAM are frozen throughout, so nothing about
-them changes step to step) -- PK batches are then drawn from indices into that cache, not by
-re-running the encoder.
+The whole training set's part-embeddings are cached once under no_grad before the training loop
+starts (BPBreID/BPAM are frozen throughout, so nothing about them changes step to step) -- PK
+batches are then drawn from indices into that cache, not by re-running the encoder. Unlike an
+earlier version of this file, there is no upstream visibility filter before this cache is built:
+every image in the dataset is cached and trained on, no exceptions (see below for why).
 
-No per-branch visibility gating inside the loss loop -- every branch contributes for every cached
-sample, unconditionally, per reid_pipeline_plan.md's part-relational-attention addendum (section
-0.1). Reliability is handled once, upstream, by the visibility filter below
-(pcr/utils/visibility_filter.py) rejecting whole images before caching.
+No hard per-branch visibility gating anywhere -- every branch contributes for every cached
+sample, unconditionally. Reliability is instead handled by *weighting*, not exclusion:
+build_encoder (below) switches this stage's own encoder to continuous (not binary) visibility
+scores, and each part's own InfoNCELoss call is weighted by that part's own per-image visibility
+(cached alongside the features, in cached_visibility) -- a poorly-visible part contributes
+proportionally less to its own loss term instead of the whole image being rejected outright. This
+replaces the upstream image-level filter this file used to run (pcr/utils/visibility_filter.py,
+deleted -- see progress.md's entry on this change): that filter discarded 61% of Market1501's
+training images in practice, was the wrong granularity (an image with 4 good parts and 1 occluded
+one lost all 4), and was found to be driven by an undertrained BPAM signal rather than genuine
+occlusion. VisualAttentionBlock/TextualAttentionBlock themselves still do no masking of any kind
+(see pcr/models/relation_blocks.py's own docstring and changes.md's entry on this -- a deliberate,
+separately-tracked scope limit, not fixed by this change).
+
+No parallel visibility-weighting mechanism exists for the text side (PromptLearner.part_ctx/
+TextualAttentionBlock) -- none is needed. part_ctx is indexed only by identity label
+(build_part_prompts(labels)); it has no per-image input at all, so there's no independent
+"text visibility" to weight. The gradient that reaches part_ctx/TAB through InfoNCELoss's own
+per-image weighting is already an implicitly visibility-weighted aggregate over whichever
+instances of that identity are in the current PK batch -- a heavily-occluded instance
+contributes proportionally less gradient automatically, as a direct consequence of contributing
+less to the (now-weighted) loss value itself. It adapts via the InfoNCE loss alone.
 
 Produces two files consumed by examples/cache_text_anchors.py (not by Stage 2 directly -- see
 that script's own docstring for why the final text-prototype computation is a separate step):
@@ -91,7 +110,6 @@ from pcr.utils.data.preprocessor import Preprocessor
 from pcr.utils.logging import Logger
 from pcr.utils.lr_scheduler import WarmupCosineLR
 from pcr.utils.osutils import mkdir_if_missing
-from pcr.utils.visibility_filter import filter_by_visibility
 
 
 def get_data(name, data_dir):
@@ -162,6 +180,14 @@ def build_encoder(cfg):
     model_cfg = BPBReIDModelCfg(backbone=cfg.model.backbone)
     model_cfg.masks.parts_num = cfg.model.parts_num
     model_cfg.dim_reduce_output = cfg.model.dim_reduce_output
+    # Continuous visibility scores, not the dataclass's own binary default -- needed for
+    # InfoNCELoss's per-part weighting to be meaningfully graduated rather than near-binary.
+    # Overridden only here (this stage's own encoder construction), not in BPBReIDModelCfg's
+    # shared default -- Stage 3 stays binary, untouched. Stage 1's encoder calls .eval()
+    # immediately below and never leaves eval mode, so testing_binary_visibility_score is the
+    # one that's actually reachable here; training_binary_visibility_score is set for symmetry.
+    model_cfg.training_binary_visibility_score = False
+    model_cfg.testing_binary_visibility_score = False
     encoder = BPBReIDEncoder(model_cfg, checkpoint_path=cfg.model.checkpoint_path or None).cuda()
     encoder.eval()
     for p in encoder.parameters():
@@ -208,18 +234,15 @@ def main_worker(cfg, setup_only=False):
     vab = VisualAttentionBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.vab.num_heads,
                                num_layers=cfg.vab.num_layers).cuda()
 
-    print("==> Filtering training set by visibility index (threshold={})".format(
-        cfg.visibility.lambda_v_min))
-    train_set, _ = filter_by_visibility(
-        sorted(dataset.train), encoder, cfg.data.height, cfg.data.width,
-        cfg.visibility.lambda_v_min, root=dataset.images_dir, batch_size=cfg.data.cache_batch_size,
-        workers=cfg.data.workers)
-
-    print("==> Caching part-embeddings for the filtered training set (frozen encoder, single pass)")
+    train_set = sorted(dataset.train)
+    print("==> Caching part-embeddings for the full training set (frozen encoder, single pass, "
+          "no upstream filtering -- every image enters training, weighted per-part inside the "
+          "loss instead)")
     cache_loader = get_cache_loader(train_set, dataset.images_dir, cfg.data.height, cfg.data.width,
                                      cfg.data.cache_batch_size, cfg.data.workers)
     cached_features, cached_visibility, cached_labels = cache_part_features(encoder, cache_loader)
     cached_features = cached_features.cuda()
+    cached_visibility = cached_visibility.cuda()
     cached_labels = cached_labels.cuda()
     num_images = cached_labels.size(0)
     print("==> Cached {} images across {} identities, {} branches".format(
@@ -265,6 +288,7 @@ def main_worker(cfg, setup_only=False):
         for it, b_idx in enumerate(batches):
             b_labels = cached_labels[b_idx]
             b_features = cached_features[b_idx]  # [b, 1+K, D], already L2-normalized per branch
+            b_vis = cached_visibility[b_idx]     # [b, 1+K]
 
             optimizer.zero_grad()
 
@@ -276,7 +300,8 @@ def main_worker(cfg, setup_only=False):
             for k in range(num_parts):
                 part_text = text_encoder(prompts[1 + k], prompt_learner.tokenized_prompts).float()
                 visual_k = part_visual[:, k, :]
-                loss = loss + infonce(visual_k, part_text, b_labels)
+                w_k = b_vis[:, 1 + k]  # same 1+k branch offset as prompts[1+k]/part_visual[:,k,:]
+                loss = loss + infonce(visual_k, part_text, b_labels, w_k)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)

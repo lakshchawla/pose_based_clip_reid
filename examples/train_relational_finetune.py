@@ -36,11 +36,21 @@ weight of 1 in the algorithm's own formula, which this file's id_weight/triplet_
 config knobs default to (kept configurable rather than hardcoded to 1, since every other stage in
 this repo already exposes its loss weights the same way).
 
-No per-branch visibility gating anywhere in these loss computations -- every branch contributes
-for every sample, unconditionally, matching reid_pipeline_plan.md's part-relational-attention
-addendum (section 0.1). Reliability is handled once, upstream, by the same visibility filter
-Stage 1 uses (pcr/utils/visibility_filter.py), applied to this stage's own training set before
-the first epoch.
+No hard per-branch visibility gating anywhere in these loss computations -- every branch
+contributes for every sample, unconditionally. Reliability is handled by *weighting*, not
+exclusion, same design as Stage 1: build_encoder switches this stage's own encoder to continuous
+(not binary) visibility scores, L_align is weighted per-part by that part's own visibility
+(CosineAlignLoss's weights argument), and L_tri_global/L_tri_parts keep a loose hard exclusion via
+PartTripletLoss's own parts_visibility argument (batch-hard mining's max/min operations don't
+compose with soft weights the way InfoNCE/align's weighted means do -- see
+configs/stage2_relational_finetune.yaml's loss.triplet_visibility_min comment). This replaces the
+upstream image-level filter Stage 1/2 both used to run (pcr/utils/visibility_filter.py, deleted --
+see progress.md's entry on this change) before either stage's training set was ever built: that
+filter discarded 61% of Market1501's training images in practice, was the wrong granularity (an
+image with 4 good parts and 1 occluded one lost all 4), and was found to be driven by an
+undertrained BPAM signal rather than genuine occlusion. VisualAttentionBlock itself still does no
+masking of any kind (see pcr/models/relation_blocks.py's own docstring and changes.md's entry on
+this -- a deliberate, separately-tracked scope limit, not fixed by this change).
 
 End-of-training checkpoint (Algorithm 2 step 20) bundles VisualAttentionBlock's state into the
 SAME saved dict as the encoder's own state ('vab_state_dict' alongside 'state_dict'), rather than
@@ -83,7 +93,6 @@ from pcr.utils.data.preprocessor import Preprocessor, PreprocessorMaskedSingleVi
 from pcr.utils.logging import Logger
 from pcr.utils.osutils import mkdir_if_missing
 from pcr.utils.serialization import save_checkpoint, load_checkpoint
-from pcr.utils.visibility_filter import filter_by_visibility
 
 
 def get_data(name, data_dir):
@@ -142,6 +151,14 @@ def build_encoder(cfg):
     model_cfg = BPBReIDModelCfg(backbone=cfg.model.backbone)
     model_cfg.masks.parts_num = cfg.model.parts_num
     model_cfg.dim_reduce_output = cfg.model.dim_reduce_output
+    # Continuous visibility scores, not the dataclass's own binary default -- needed for
+    # CosineAlignLoss's per-part weighting (and PartTripletLoss's parts_visibility mask) to work
+    # as intended. Overridden only here (this stage's own encoder construction), not in
+    # BPBReIDModelCfg's shared default -- Stage 3 stays binary, untouched. Unlike Stage 1, this
+    # encoder genuinely toggles between .train() (main loop) and .eval() (inside Evaluator.evaluate,
+    # called periodically), so both flags are live here.
+    model_cfg.training_binary_visibility_score = False
+    model_cfg.testing_binary_visibility_score = False
     encoder = BPBReIDEncoder(model_cfg, checkpoint_path=cfg.model.checkpoint_path or None).cuda()
     encoder.train()
     for p in encoder.parameters():
@@ -174,6 +191,11 @@ def compute_losses(encoder, vab, id_classifiers, triplet_loss, id_loss, align_lo
     combined = torch.cat([f_out[:, 0:1, :], relation_parts], dim=1)  # [B, 1+K, D]
     num_branches = combined.size(1)
 
+    # vis shares combined's exact branch axis (0=foreground, 1..K=parts) -- both are built from
+    # the same encoder call. Loose hard exclusion for triplet's batch-hard mining only (soft
+    # weights don't compose with max/min mining); continuous weighting for align, below.
+    vis_mask = vis >= cfg.loss.triplet_visibility_min  # [B, 1+K] bool
+
     total = f_out.new_zeros(())
     log = {}
 
@@ -187,11 +209,10 @@ def compute_losses(encoder, vab, id_classifiers, triplet_loss, id_loss, align_lo
     # separate per-part batch-hard triplet losses, summed) -- two independent computations, not
     # one triplet loss fused across all M branches' distances the way this loop used to call
     # PartTripletLoss once on `combined` directly. Calling PartTripletLoss with a single-branch
-    # slice ([B, 1, D]) gives that branch's own, unfused batch-hard mining -- no parts_visibility
-    # argument anywhere here either way, per reid_pipeline_plan.md's part-relational-attention
-    # addendum section 0.1 (every branch contributes for every sample unconditionally; reliability
-    # is handled once, upstream, by the visibility filter applied to the training set).
-    global_result = triplet_loss(combined[:, 0:1, :], targets)
+    # slice ([B, 1, D]) gives that branch's own, unfused batch-hard mining. parts_visibility is a
+    # loose boolean exclusion (vis_mask, threshold cfg.loss.triplet_visibility_min) -- the one
+    # place hard exclusion still applies in this design; see module docstring.
+    global_result = triplet_loss(combined[:, 0:1, :], targets, parts_visibility=vis_mask[:, 0:1])
     if global_result is not None:
         l_tri_global = global_result[0]
         total = total + cfg.loss.triplet_weight * l_tri_global
@@ -199,7 +220,8 @@ def compute_losses(encoder, vab, id_classifiers, triplet_loss, id_loss, align_lo
 
     l_tri_parts = f_out.new_zeros(())
     for branch in range(1, num_branches):
-        part_result = triplet_loss(combined[:, branch:branch + 1, :], targets)
+        part_result = triplet_loss(combined[:, branch:branch + 1, :], targets,
+                                    parts_visibility=vis_mask[:, branch:branch + 1])
         if part_result is not None:
             l_tri_parts = l_tri_parts + part_result[0]
     total = total + cfg.loss.triplet_weight * l_tri_parts
@@ -214,7 +236,8 @@ def compute_losses(encoder, vab, id_classifiers, triplet_loss, id_loss, align_lo
     align_total = f_out.new_zeros(())
     for branch in range(1, num_branches):
         branch_anchors = text_prototypes[targets, branch, :]  # [B, D], gathered per sample's own identity
-        align_total = align_total + align_loss(combined[:, branch, :], branch_anchors)
+        w = vis[:, branch]  # continuous weighting, not the boolean vis_mask used for triplet
+        align_total = align_total + align_loss(combined[:, branch, :], branch_anchors, weights=w)
     total = total + cfg.loss.align_weight * align_total
     log['align'] = align_total.item()
 
@@ -283,23 +306,16 @@ def main_worker(cfg, setup_only=False):
     use_masks = bool(cfg.data.masks_dir)
     bpa_loss = BodyPartAttentionLoss().cuda() if use_masks else None
 
-    print("==> Filtering training set by visibility index (threshold={})".format(
-        cfg.visibility.lambda_v_min))
-    encoder.eval()
-    filtered_train_set, _ = filter_by_visibility(
-        sorted(dataset.train), encoder, cfg.data.height, cfg.data.width,
-        cfg.visibility.lambda_v_min, root=dataset.images_dir, batch_size=cfg.data.batch_size,
-        workers=cfg.data.workers)
-    encoder.train()
-
-    train_loader = get_train_loader(dataset, cfg, filtered_train_set)
+    train_set = sorted(dataset.train)
+    train_loader = get_train_loader(dataset, cfg, train_set)
     test_loader = get_test_loader(dataset, cfg.data.height, cfg.data.width, cfg.data.batch_size,
                                    cfg.data.workers)
 
     if setup_only:
-        print('==> Setup complete: {} identities, {} branches, {} images after visibility '
-              'filtering, masks {}. Exiting before the training loop (--setup-only).'.format(
-                  num_identities, num_branches, len(filtered_train_set),
+        print('==> Setup complete: {} identities, {} branches, {} images (no upstream visibility '
+              'filtering -- every training image is used, weighted per-part inside the loss), '
+              'masks {}. Exiting before the training loop (--setup-only).'.format(
+                  num_identities, num_branches, len(train_set),
                   'ON (' + cfg.data.masks_dir + ')' if use_masks else 'off'))
         return
 

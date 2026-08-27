@@ -8,8 +8,11 @@
 # here, starting from Stage 1's weights (also read from stage1.prompt_dir). See
 # examples/train_relational_finetune.py.
 #
-# Renamed from stage2_backbone_finetune.yaml -- pairs with the renamed script; the vab:/
-# visibility: sections below are the new content relative to that file.
+# Renamed from stage2_backbone_finetune.yaml -- pairs with the renamed script; the vab: section
+# below is the new content relative to that file. No visibility: section -- the upstream
+# image-level filter this used to configure was removed (see progress.md's entry on this); every
+# image is used, weighted per-part inside CosineAlignLoss, with a loose hard exclusion for
+# triplet only (loss.triplet_visibility_min, below).
 
 model:
   backbone: hrnet32          # must match stage1's model.backbone -- see stage1.prompt_dir note below
@@ -29,11 +32,6 @@ stage1:
 vab:
   num_heads: 4                 # must match stage1's vab.num_heads/num_layers -- these define the
   num_layers: 1                # architecture vab.pth's weights were trained for
-
-visibility:
-  # same upstream candidate-acceptance gate as Stage 1 (pcr/utils/visibility_filter.py), applied
-  # to this stage's own training set before the first epoch
-  lambda_v_min: 0.5
 
 data:
   dataset: market1501         # or dukemtmc-reid
@@ -65,6 +63,13 @@ loss:
   # implicit weight -- both use this same triplet_weight rather than two separate knobs.
   triplet_weight: 1.0
   triplet_margin: 0.3
+  # Loose hard-exclusion floor for PartTripletLoss's parts_visibility mask ONLY -- batch-hard
+  # mining's max/min operations don't compose with soft weights, so triplet keeps a boolean
+  # exclude/include decision (unlike InfoNCE/align, which use continuous weighting). Deliberately
+  # much looser than the removed upstream image-level lambda_v_min=0.5 filter: this only needs to
+  # drop true degenerate cases (a branch reading as essentially never-visible), not gate whole
+  # images out of training the way that filter did.
+  triplet_visibility_min: 0.05
   align_weight: 0.5             # lambda_clip in Algorithm 2's own notation -- the one term the
                                  # algorithm itself gives an explicit, separate coefficient
   bpa_weight: 0.35                   # only used when data.masks_dir is set; bpbreid's own yaml default

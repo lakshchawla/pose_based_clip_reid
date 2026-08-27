@@ -2005,3 +2005,92 @@ dev GPU is currently occupied by the user's own `init.ipynb` notebook kernel; th
 the smoke test for now rather than free it up) -- treat this as compile-checked only until a real
 Stage 1 run confirms `InfoNCELoss` and the normalized `VisualAttentionBlock` output behave as
 expected together.
+
+---
+
+### 2026-08-27 14:20 — Replaced the upstream visibility filter with per-part loss weighting
+### (Stage 1 and Stage 2)
+
+A diagnostic (gate-check on 20 samples, then all 12936 Market1501 training images) found the
+upstream image-level filter (`pcr/utils/visibility_filter.py::filter_by_visibility`, gating on
+`lambda_v_min=0.5`) discarded 61% of training images (7895/12936) -- and that this was a
+training-collapse artifact of an undertrained BPAM (one part branch reading as permanently
+invisible across the *entire* dataset, another as visible 95.7% of the time regardless of
+content), not genuine occlusion. Independent of that root cause, the filter was also the wrong
+granularity: an image-level mean visibility score threw away an entire image (all K parts, even
+well-visible ones) because of a single occluded part.
+
+User proposed replacing the hard filter with per-part *weighting* inside the loss functions
+instead of masking whole images out upstream. Three decisions confirmed directly before
+implementing:
+1. Stage 1/2's own `build_encoder(cfg)` switch to continuous (not binary) visibility scores --
+   `BPBReIDModelCfg.training_binary_visibility_score`/`testing_binary_visibility_score` overridden
+   to `False` only in these two stages' own encoder construction (Stage 3 stays binary, untouched
+   in the shared dataclass default). Binary scores would have made "weighted" loss nearly
+   equivalent to hard masking, defeating the point.
+2. `VisualAttentionBlock`/`TextualAttentionBlock` stay unchanged -- no masking added to their own
+   self-attention. Logged as a known, deliberate gap in `changes.md` (a genuinely-occluded part's
+   feature still gets blended at full weight into every other part's post-attention output via
+   self-attention, before any loss-level weighting gets a chance to discount it).
+3. No replacement filter of any kind -- every image, including ones where every part reads as
+   invisible, now enters training and gets weighted (its weight simply floors out near zero).
+
+**`pcr/loss/clip_infonce_loss.py::InfoNCELoss`**: `weights` is now a required 4th positional
+argument (single caller, no reason to keep `None`-handling dead code). Both cross-entropy calls
+switched to `reduction='none'`, then combined via `(weights.clamp(min=1e-3) * per_sample).sum() /
+weights.clamp(min=1e-3).sum().clamp(min=1e-8)`. Also changed `first_idx`'s selection rule (the
+representative row picked per unique identity, used for both negative-dedup and as the anchor for
+both directions) from "first occurrence in the batch" to "highest-weighted (most visible)
+occurrence" -- t2i's whole quality rides on that one row's visual embedding, and PK batches
+already have `num_instances` copies of each identity to pick the best of, essentially free.
+
+**`pcr/loss/clip_cosine_align_loss.py::CosineAlignLoss`**: gained an `__init__` (previously had
+none) holding `weight_floor=1e-3`; `weights` is now a required 3rd positional argument, same
+weighted-mean formula as `InfoNCELoss`, no per-identity dedup complexity needed since this loss
+was already single-directional per-sample.
+
+**`pcr/loss/part_triplet_loss.py::PartTripletLoss`**: no code changes -- it already fully
+implemented visibility-weighted/masked distance combination via its `parts_visibility` argument
+(confirmed by reading it directly), just never actually called with one anywhere. Now wired up
+in Stage 2 with a loose boolean threshold (`vis >= cfg.loss.triplet_visibility_min`, default
+0.05) -- batch-hard mining's max/min operations don't compose with soft weights, so triplet keeps
+a hard exclude/include decision, deliberately much looser than the removed filter's 0.5.
+
+**`examples/train_relational_prompts.py`** (Stage 1): `build_encoder` overrides both binary-
+visibility flags. `filter_by_visibility` import and call removed -- `train_set = sorted(dataset.
+train)` directly, all 12936 images cached (previously 5041 survived the filter).
+`cached_visibility` (previously computed but never used) is now moved to `.cuda()` alongside
+`cached_features`/`cached_labels` and indexed per-batch (`b_vis = cached_visibility[b_idx]`);
+`w_k = b_vis[:, 1 + k]` (same `1+k` branch offset already used for `prompts[1+k]`) is passed into
+each part's `infonce(...)` call.
+
+**`examples/train_relational_finetune.py`** (Stage 2): `build_encoder` overrides both binary-
+visibility flags. `filter_by_visibility` call and the `.eval()`/`.train()` toggle that existed
+solely to run it safely are both removed -- `train_set = sorted(dataset.train)` directly, all
+12936 images now trained on (previously fewer, filtered). `vis` (previously obtained from the
+encoder but completely dead) is now used: `vis_mask = vis >= cfg.loss.triplet_visibility_min`
+passed as `parts_visibility` into both the `tri_global` and `tri_parts` `PartTripletLoss` calls;
+continuous `vis[:, branch]` passed as `weights` into each part's `align_loss(...)` call.
+
+**Configs**: both `visibility:` sections deleted entirely (Stage 1 has no triplet loss, so no
+replacement knob needed there); Stage 2's `loss:` section gains `triplet_visibility_min: 0.05`.
+
+**Docs**: `pcr/models/relation_blocks.py`'s module docstring, both training scripts' module
+docstrings, `README.md`'s Stage 1/2 sections, and `METHODOLOGY.md` §3.5.2 (rewritten) and its two
+Algorithm-pseudocode step-1 lines all updated to describe the weighting scheme instead of the
+deleted filter. `changes.md`: added the VAB/TAB-still-unmasked entry (item 2).
+
+**`pcr/utils/visibility_filter.py` deleted entirely** -- confirmed via repo-wide grep it had
+exactly two callers (both training scripts, both removed here) and no other references.
+
+**Verified with real training runs on both stages** (not `--setup-only` alone): Stage 1 --
+`--setup-only` confirmed 12936 cached images (not 5041); a real 1-epoch run completed cleanly (375
+PK batches, finite loss throughout, `VAB gate` moving normally, `prompt_learner.pth`/`vab.pth`
+saved). Stage 2 -- `--setup-only` confirmed 12936 training images; a real 1-epoch run (masks on,
+BPA loss active) completed cleanly with every loss term finite (`id`~6.65, `tri_global` 0.15-0.56,
+`tri_parts` 1.28-2.0, `align` 1.7-2.3, `bpa` 0.85-1.15), Mean AP 3.0%, top-1 6.8%/top-5 17.0%/
+top-10 24.6%, checkpoint saved and reloaded correctly for the final eval pass.
+
+Full repo `python -m py_compile` sweep clean. This fixes the *mechanism* for using visibility
+correctly; it does not fix BPAM's underlying training-collapse (that needs a real 60-epoch Stage 0
+run, not yet done) -- the weight distribution won't look well-behaved until that happens.

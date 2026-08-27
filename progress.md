@@ -2094,3 +2094,66 @@ top-10 24.6%, checkpoint saved and reloaded correctly for the final eval pass.
 Full repo `python -m py_compile` sweep clean. This fixes the *mechanism* for using visibility
 correctly; it does not fix BPAM's underlying training-collapse (that needs a real 60-epoch Stage 0
 run, not yet done) -- the weight distribution won't look well-behaved until that happens.
+
+---
+
+### 2026-08-28 — Fixed Stage 2's `CosineAlignLoss`: detached the visibility-weight gradient leak,
+### restored a real classification (repulsion) term against the full identity-prototype table
+
+A code review (two subagents -- one code-focused, one methodology-focused -- reviewing Stage 0/1/2
+end to end against their own docstrings and the original CLIP-ReID design) surfaced two real
+problems in `pcr/loss/clip_cosine_align_loss.py::CosineAlignLoss`, written up in `changes.md`'s
+"Red flag 1" and "Red flag 4" and `IMPROVEMENT_PLAN.md` sections 1 and 3. Both fixed here, in the
+align-loss code path only (Stage 1's `InfoNCELoss` and Stage 2's triplet/id/bpa losses untouched).
+
+**Fix 1 -- gradient leak**: Stage 2's `build_encoder` switches to continuous (differentiable)
+visibility scores, and `vis[:, branch]` was passed straight into `CosineAlignLoss` as its per-sample
+weight with no `.detach()` anywhere in the chain. Since `L = (Σ w_i l_i) / (Σ w_i)`, `∂L/∂w_j =
+(l_j - L) / Σw` -- for any sample whose alignment loss was worse than the batch average, gradient
+descent had a standing incentive to lower that sample's own visibility weight instead of actually
+improving its alignment. Fixed with one line: `w = weights.detach().clamp(min=self.weight_floor)`.
+Verified in isolation (see below) that `weights.grad` is `None` after `backward()` while gradient
+still reaches `visual_features` normally.
+
+**Fix 2 -- missing repulsion term**: the old loss was a pure per-sample regression, `1 -
+cos(v_i, t_{y_i})`, with no other identity's text anchor ever involved -- nothing pushed different
+identities' features apart, unlike CLIP-ReID's own original `I2TLoss` (a full classification
+against the whole prototype table). Rewrote `CosineAlignLoss.forward` to take the branch's *full*
+`[num_identities, D]` prototype table plus `targets`, and compute a temperature-scaled,
+weighted-mean cross-entropy against it (`logits = visual_features @ text_anchors_table.t() /
+temperature`) -- restoring real inter-identity negatives via the softmax denominator, same
+mechanism InfoNCELoss/CLIP already use elsewhere in this repo. Added `loss.align_temperature: 0.07`
+to `configs/stage2_relational_finetune.yaml` (same constant CLIP/Stage-1 already use).
+
+**Call site** (`examples/train_relational_finetune.py::compute_losses`): now passes
+`text_prototypes[:, branch, :]` (the full table) and `targets` instead of the old
+`text_prototypes[targets, branch, :]` per-sample gather.
+
+**Verified**:
+1. Isolated forward/backward shape+gradient check (synthetic tensors, no GPU/dataset needed):
+   finite loss for both a normal-weight batch and an all-zero-weight batch (floor working),
+   `visual_features.grad` populated, `weights.grad is None` (confirms the detach closes the leak),
+   logits shape `[B, num_identities]` as expected.
+2. Real one-epoch Stage 2 smoke run (`batch_size=8`, masks on, `stage1.prompt_dir` pointed at an
+   existing smoke checkpoint set with matching architecture) -- 375/375 iterations completed, every
+   loss term (`id`, `tri_global`, `tri_parts`, `align`, `bpa`) finite throughout, no NaN/Inf/
+   traceback anywhere in the log. `align` trended down over the epoch (~56 -> ~44-46), consistent
+   with real learning rather than a stuck/broken loss. As a side confirmation, this run's
+   `Successfully loaded pretrained weights from "examples/logs/stage0_bpa/model_best.pth.tar"`
+   printed with **zero discarded layers** -- directly inspecting that checkpoint's keys confirmed
+   it's genuinely HRNet32-shaped now (has `stage2`/`stage3`/`transition1`, no ResNet-signature
+   `layer2`/`layer3`/`layer4`), so the Stage0->Stage2 handoff is currently healthy.
+
+**New, not-yet-acted-on finding from the smoke test**: the new loss's raw magnitude (~35-50 summed
+over 5 part branches) is far larger than the old regression version's bounded `[0, 2]` range, since
+it's now a 751-way softmax. `loss.align_weight` (`0.5`) was not retuned -- left as a follow-up for
+whoever runs the next real (non-smoke) training job, noted in `IMPROVEMENT_PLAN.md` section 3.
+
+`changes.md`'s "Red flag 1" and "Red flag 4" marked resolved (struck through, pointing here) rather
+than deleted, per this file's own convention of leaving a trail. `InfoNCELoss`'s identical
+undetached-weight pattern (Stage 1) was deliberately left as-is -- not currently exploitable, since
+its weights come from a `no_grad` caching pass, not a live graph -- and remains an open, low-
+priority follow-up in `IMPROVEMENT_PLAN.md` section 1.
+
+Full repo `python -m py_compile` sweep clean (`pcr/loss/clip_cosine_align_loss.py`,
+`examples/train_relational_finetune.py`).

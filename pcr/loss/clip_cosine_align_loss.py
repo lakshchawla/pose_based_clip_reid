@@ -1,38 +1,40 @@
-"""Faithful port of "Algorithm 2 -- Stage 2: Backbone Fine-Tuning" step 14's own alignment term:
-`1 - cosine_sim(relation_feats[:,k], frozen_text_anchors[label,k])` -- NOT CLIP-ReID's I2TLoss
-(pcr/loss/clip_i2t_loss.py, removed: this was Stage 2's only caller), which is a full
-label-smoothed cross-entropy classification against the *entire* frozen prototype table (every
-other identity's anchor acts as an implicit negative via the softmax). This loss has no such
-notion -- it is a direct, per-sample regression toward the sample's own identity's anchor only;
-no other identity's prototype participates at all.
+"""Classification-style rewrite of Stage 2's alignment term, replacing the earlier pure-regression
+version (`1 - cosine_sim(relation_feats[:,k], frozen_text_anchors[label,k])`, no other identity's
+anchor involved at all). Restores CLIP-ReID's own original mechanism -- a softmax classification
+against the *entire* frozen prototype table, so every other identity's anchor acts as an implicit
+negative -- while keeping this repo's per-part visibility weighting on top. See changes.md's "Red
+flag 4" and IMPROVEMENT_PLAN.md section 3 for the full rationale: a loss with no repulsion term at
+all can be minimized by letting every identity's features drift toward each other, which is exactly
+backwards for re-identification.
 
-Unlike I2TLoss (which takes the whole [num_identities, D] prototype table and an index tensor,
-since it needs every row for its softmax), this loss takes pre-gathered per-sample anchors --
-the caller indexes text_prototypes[targets, k, :] before calling this, since there is nothing
-else in the table this loss needs to see.
-
-Per-sample `weights` (required, not optional -- this class has exactly one caller,
-examples/train_relational_finetune.py, which always has a per-branch visibility score available
-once Stage 2's own encoder construction switches to continuous visibility scores): replaces the
-upstream image-level visibility filter this repo used to run before Stage 2 ever saw an image.
-Every image now enters training; a branch with low visibility for a given sample contributes
-proportionally less to that branch's own alignment term instead of the whole image being rejected
-outright. Weights are floored (`weight_floor`, default 1e-3) so no sample is ever exactly
-zero-weighted, matching pcr/loss/clip_infonce_loss.py::InfoNCELoss's identical convention.
+Per-sample `weights` (required, not optional -- same convention as pcr/loss/clip_infonce_loss.py's
+InfoNCELoss): a branch with low visibility for a given sample contributes proportionally less to
+that branch's own alignment term. Explicitly detached before use (`weights.detach()`) -- IMPROVEMENT_
+PLAN.md section 1 / changes.md's "Red flag 1": examples/train_relational_finetune.py's own encoder
+construction switches to continuous (differentiable) visibility scores, so without detaching here,
+gradient descent has a standing incentive to lower a hard-to-align part's own visibility score
+instead of actually improving its alignment -- a shortcut that reduces this loss without the
+network doing the work the loss is meant to encourage. Weights are additionally floored
+(`weight_floor`, default 1e-3) so no sample is ever exactly zero-weighted.
 """
-import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn as nn
 
 
 class CosineAlignLoss(nn.Module):
-    def __init__(self, weight_floor=1e-3):
+    def __init__(self, temperature=0.07, weight_floor=1e-3):
         super(CosineAlignLoss, self).__init__()
+        self.temperature = temperature
         self.weight_floor = weight_floor
 
-    def forward(self, visual_features, text_anchors, weights):
-        """visual_features: [B, D]. text_anchors: [B, D], already gathered for each sample's own
-        identity/branch. weights: [B] float, per-image visibility score for this branch. Returns
-        the weighted mean of 1 - cosine_similarity."""
-        per_sample = 1 - F.cosine_similarity(visual_features, text_anchors, dim=-1)  # [B]
-        w = weights.clamp(min=self.weight_floor)
+    def forward(self, visual_features, text_anchors_table, targets, weights):
+        """visual_features: [B, D], one branch's pooled+relation-mixed feature per sample.
+        text_anchors_table: [num_identities, D], this branch's full frozen prototype table (every
+        identity, not just the ones in this batch) -- the source of the negatives this loss was
+        previously missing. targets: [B] long, each sample's identity index into that table.
+        weights: [B] float, per-sample visibility score for this branch; detached internally.
+        Returns the weighted mean cross-entropy of classifying each sample against the full table."""
+        w = weights.detach().clamp(min=self.weight_floor)
+        logits = visual_features @ text_anchors_table.t() / self.temperature  # [B, num_identities]
+        per_sample = F.cross_entropy(logits, targets, reduction='none')  # [B]
         return (w * per_sample).sum() / w.sum().clamp(min=1e-8)

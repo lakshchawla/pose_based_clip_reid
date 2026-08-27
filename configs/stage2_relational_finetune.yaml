@@ -72,6 +72,10 @@ loss:
   triplet_visibility_min: 0.05
   align_weight: 0.5             # lambda_clip in Algorithm 2's own notation -- the one term the
                                  # algorithm itself gives an explicit, separate coefficient
+  # CosineAlignLoss is a softmax classification against the full identity-prototype table (see
+  # pcr/loss/clip_cosine_align_loss.py's own docstring) -- 0.07 matches Stage 1's InfoNCELoss and
+  # CLIP's own established optimal starting temperature, reused here for the same reason.
+  align_temperature: 0.07
   bpa_weight: 0.35                   # only used when data.masks_dir is set; bpbreid's own yaml default
 
 optim:

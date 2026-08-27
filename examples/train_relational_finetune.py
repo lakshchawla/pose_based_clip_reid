@@ -16,13 +16,17 @@ correspondence to that algorithm's own names:
   L_id_global                  id_loss (CrossEntropyLabelSmooth) on the global classifier's logits
   L_tri_global + L_tri_parts    two separate PartTripletLoss calls, NOT one fused call across all
                                branches -- see compute_losses' own comments for why this matters
-  L_align                      CosineAlignLoss (pcr/loss/clip_cosine_align_loss.py) -- literal
-                               1-cosine_sim per part against that identity's frozen anchor, NOT
-                               CLIP-ReID's I2TLoss (removed: this was its only caller), which was
-                               a full cross-entropy classification against the whole prototype
-                               table. Parts only (branches 1..K) -- no foreground/global alignment
-                               term at all, matching Stage 1's own scope (fg_ctx is never trained
-                               there, so a foreground anchor would be meaningless noise; see
+  L_align                      CosineAlignLoss (pcr/loss/clip_cosine_align_loss.py) -- a softmax
+                               classification of each part's feature against that branch's FULL
+                               frozen prototype table (every identity acts as an implicit negative
+                               via the softmax), restoring CLIP-ReID's own original I2TLoss
+                               mechanism rather than the literal per-sample regression Algorithm 2's
+                               own wording describes (see changes.md's "Red flag 4" /
+                               IMPROVEMENT_PLAN.md section 3 for why the pure-regression version was
+                               replaced -- it had no term pushing different identities' features
+                               apart at all). Parts only (branches 1..K) -- no foreground/global
+                               alignment term at all, matching Stage 1's own scope (fg_ctx is never
+                               trained there, so a foreground anchor would be meaningless noise; see
                                changes.md's now-resolved entry on this).
   L_attn                       BodyPartAttentionLoss, mandatory by default now (data.masks_dir
                                defaults to Market1501's real masks, matching Algorithm 2's own
@@ -40,10 +44,11 @@ No hard per-branch visibility gating anywhere in these loss computations -- ever
 contributes for every sample, unconditionally. Reliability is handled by *weighting*, not
 exclusion, same design as Stage 1: build_encoder switches this stage's own encoder to continuous
 (not binary) visibility scores, L_align is weighted per-part by that part's own visibility
-(CosineAlignLoss's weights argument), and L_tri_global/L_tri_parts keep a loose hard exclusion via
-PartTripletLoss's own parts_visibility argument (batch-hard mining's max/min operations don't
-compose with soft weights the way InfoNCE/align's weighted means do -- see
-configs/stage2_relational_finetune.yaml's loss.triplet_visibility_min comment). This replaces the
+(CosineAlignLoss's weights argument, detached before use -- see that file's own docstring for why),
+and L_tri_global/L_tri_parts keep a loose hard exclusion via PartTripletLoss's own parts_visibility
+argument (batch-hard mining's max/min operations don't compose with soft weights the way
+InfoNCE/align's weighted means do -- see configs/stage2_relational_finetune.yaml's
+loss.triplet_visibility_min comment). This replaces the
 upstream image-level filter Stage 1/2 both used to run (pcr/utils/visibility_filter.py, deleted --
 see progress.md's entry on this change) before either stage's training set was ever built: that
 filter discarded 61% of Market1501's training images in practice, was the wrong granularity (an
@@ -227,17 +232,19 @@ def compute_losses(encoder, vab, id_classifiers, triplet_loss, id_loss, align_lo
     total = total + cfg.loss.triplet_weight * l_tri_parts
     log['tri_parts'] = l_tri_parts.item()
 
-    # Algorithm 2 steps 14-15: L_align, 1-cosine_sim per part against that identity's frozen text
-    # anchor, summed over the K PART branches only -- no foreground/global alignment term at all,
-    # matching Stage 1's own scope exactly (fg_ctx is never trained there -- see progress.md's
-    # entry on that rewrite -- so text_prototypes[:, 0, :] is meaningless noise; excluding branch 0
-    # here means that noise is never actually used for anything, resolving changes.md's flagged
-    # consequence as a side effect of matching Algorithm 2's own scope, not a separate workaround).
+    # Algorithm 2 steps 14-15: L_align, a softmax classification of each part's feature against
+    # that branch's FULL frozen prototype table (every identity is an implicit negative), summed
+    # over the K PART branches only -- no foreground/global alignment term at all, matching Stage
+    # 1's own scope exactly (fg_ctx is never trained there -- see progress.md's entry on that
+    # rewrite -- so text_prototypes[:, 0, :] is meaningless noise; excluding branch 0 here means
+    # that noise is never actually used for anything, resolving changes.md's flagged consequence as
+    # a side effect of matching Algorithm 2's own scope, not a separate workaround).
     align_total = f_out.new_zeros(())
     for branch in range(1, num_branches):
-        branch_anchors = text_prototypes[targets, branch, :]  # [B, D], gathered per sample's own identity
+        branch_prototypes = text_prototypes[:, branch, :]  # [num_identities, D], full table -- the
+                                                             # negatives this loss classifies against
         w = vis[:, branch]  # continuous weighting, not the boolean vis_mask used for triplet
-        align_total = align_total + align_loss(combined[:, branch, :], branch_anchors, weights=w)
+        align_total = align_total + align_loss(combined[:, branch, :], branch_prototypes, targets, weights=w)
     total = total + cfg.loss.align_weight * align_total
     log['align'] = align_total.item()
 
@@ -302,7 +309,7 @@ def main_worker(cfg, setup_only=False):
 
     triplet_loss = PartTripletLoss(margin=cfg.loss.triplet_margin).cuda()
     id_loss = CrossEntropyLabelSmooth(num_identities).cuda()
-    align_loss = CosineAlignLoss().cuda()
+    align_loss = CosineAlignLoss(temperature=cfg.loss.align_temperature).cuda()
     use_masks = bool(cfg.data.masks_dir)
     bpa_loss = BodyPartAttentionLoss().cuda() if use_masks else None
 

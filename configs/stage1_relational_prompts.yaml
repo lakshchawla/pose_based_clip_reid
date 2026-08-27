@@ -12,7 +12,7 @@
 # this); every image is used, weighted per-part inside InfoNCELoss instead.
 
 model:
-  backbone: hrnet32          # or resnet50 -- must match Stage 0's own backbone
+  backbone: resnet50          # or resnet50 -- must match Stage 0's own backbone
   # Algorithm 1's own initialization step: load Stage 0's converged checkpoint, not ImageNet
   # init -- run examples/train_bpa_segmentation.py first (configs/stage0_bpa_segmentation.yaml)
   # to produce this file.

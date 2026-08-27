@@ -11,7 +11,7 @@
 # stage only runs against market1501.
 
 model:
-  backbone: hrnet32          # or resnet50 -- must match whatever Stage 1/2 config loads this checkpoint
+  backbone: resnet50          # or resnet50 -- must match whatever Stage 1/2 config loads this checkpoint
   checkpoint_path: ''        # optional external bpbreid checkpoint to continue from; empty = ImageNet init
   dim_reduce_output: 512     # must equal clip.arch's text embed dim if Stage 1/2 will load this checkpoint
   parts_num: 5                # K body parts; num_branches = 1 (foreground) + parts_num

@@ -56,7 +56,13 @@ class BPBReIDModelCfg:
                                 # download the first time.
     last_stride: int = 1
     dim_reduce: str = 'after_pooling'
-    dim_reduce_output: int = 512
+    # 1024, not bpbreid's own 512 default -- must equal whatever CLIP text embedding size Stage
+    # 1/2's own clip.arch config produces (no projection layer bridges the two -- see
+    # pcr/models/clip_text_encoder.py's own docstring). Loading a genuinely external bpbreid
+    # checkpoint trained at the original 512 would need this overridden back down for that one
+    # load (Stage 3's train_uda.py/train_usl.py have no CLI flag for this, only this shared
+    # default -- see BPBReIDModelCfg's own construction there).
+    dim_reduce_output: int = 1024
     hrnet_pretrained_path: str = 'pretrained_models'  # matches bpbreid's own yacs default;
                                                         # only read when backbone == 'hrnet32'
     learnable_attention_enabled: bool = True

@@ -2157,3 +2157,340 @@ priority follow-up in `IMPROVEMENT_PLAN.md` section 1.
 
 Full repo `python -m py_compile` sweep clean (`pcr/loss/clip_cosine_align_loss.py`,
 `examples/train_relational_finetune.py`).
+
+---
+
+### 2026-08-28 (2) — Made VisualAttentionBlock and TextualAttentionBlock visibility-aware
+### (IMPROVEMENT_PLAN.md section 5), and fixed a real PyTorch fast-path NaN bug found while
+### verifying it
+
+Implemented `IMPROVEMENT_PLAN.md` section 5 / `changes.md`'s item 2 and "Red flag 6": both
+relational-attention blocks previously mixed all K part tokens via fully unmasked self-attention,
+so a genuinely-occluded part's near-garbage feature was blended, at full weight, into every other
+part's post-attention representation -- contamination that loss-level visibility weighting (the
+2026-08-27 refactor) could never undo, since it only discounts a part's own direct loss
+contribution.
+
+**`pcr/models/relation_blocks.py`**: added `_visibility_attn_bias(visibility, num_heads, eps=1e-6)`
+-- builds an additive `[B*num_heads, L, L]` bias (`log(v_j)` per key `j`, broadcast over queries and
+heads) passed as `nn.TransformerEncoder`'s own `mask` argument, the same mechanism a hard
+`key_padding_mask` uses (`log(0) = -inf`), generalized to a continuous score.
+- `VisualAttentionBlock.forward` now takes a required `part_visibility: [B, K]` (that image's own
+  per-part visibility, already available at every call site) and builds the bias fresh every call.
+  The zero-init residual gate still makes this a true no-op at initialization regardless of masking
+  (verified explicitly).
+- `TextualAttentionBlock.forward` now takes a required `part_visibility: [B, K]` too, but
+  `PromptLearner.part_ctx` has no per-image signal at all (indexed by identity only) -- so this is
+  each identity's *mean* visibility across every cached training image of that identity, not a
+  per-image score. `TextualAttentionBlock.__init__` gained an `n_ctx` param so it can expand `[B,
+  K]` to `[B, K*n_ctx]` (one bias value per context token, matching the K contiguous n_ctx-token
+  blocks `PromptLearner` slices `part_ctx` into).
+
+**`pcr/models/prompt_learner.py`**: `TextualAttentionBlock` construction passes `n_ctx=n_ctx`;
+`build_part_prompts(labels, part_visibility)` gained the new required arg, threaded straight into
+`self.tab(...)`.
+
+**`examples/train_relational_prompts.py`** (Stage 1): new `compute_identity_visibility(
+cached_visibility, cached_labels, num_identities)` -- a vectorized per-identity mean over the
+already-cached per-image visibility table (`index_add_`-based, no Python loop over labels). Called
+once after caching; the training loop passes `b_vis[:, 1:]` (real, per-image) into `vab(...)` and
+`identity_visibility[b_labels, 1:]` (per-identity mean) into `build_part_prompts(...)`. The computed
+table is saved as `identity_visibility.pth` alongside `prompt_learner.pth`/`vab.pth`.
+
+**`examples/cache_text_anchors.py`**: loads `identity_visibility.pth` from the same `logs_dir` and
+reuses it unchanged (never recomputes it) when rebuilding each identity's final prompt, so TAB's
+output stays a true, deterministic function of identity alone, consistent between training and the
+frozen prototype table Stage 2 actually reads.
+
+**`examples/train_relational_finetune.py`** (Stage 2): `vab(f_out[:, 1:, :], vis[:, 1:])` -- this
+forward pass's own live per-image visibility, no separate table needed (unlike Stage 1's TAB usage,
+VAB always has a real per-image signal available in both stages).
+
+**A real bug found and fixed while verifying this, not a masking-logic error**: the first full
+end-to-end smoke run (Stage 1 -> `cache_text_anchors.py` -> Stage 2) produced `NaN` in every
+part-branch text prototype and, downstream, `NaN` in Stage 2's align loss from iteration 0.
+Bisected with a standalone repro script calling `PromptLearner.tab` directly: the real, trained
+`identity_visibility` values (min 0.15, max 0.96 -- nothing extreme, no zeros) produced `NaN` only
+when the module was in `.eval()` mode (exactly the mode `cache_text_anchors.py` correctly uses, via
+`prompt_learner.eval()`, for deterministic output); the *identical* tensors through the *identical*
+module in `.train()` mode, and in `.eval()` mode with a uniform (no-op) visibility bias, both came
+out perfectly finite. Root cause: `nn.TransformerEncoderLayer` automatically routes to a fused
+native kernel (`torch._transformer_encoder_layer_fwd`) whenever `self.training` is `False`, and
+that fused kernel doesn't correctly handle a real, non-uniform additive `attn_mask` -- confirmed via
+PyTorch's own runtime warnings during the repro ("Flash Attention does not support non-null
+attn_mask", "Memory efficient kernel not used", etc. -- all backends the fused path tried, all
+either skipped or numerically broken for this mask shape). Forcing the ordinary (non-fused) SDPA
+backend via `torch.nn.attention.sdpa_kernel` did NOT fix it, since this fused path is a separate,
+whole-encoder-layer kernel that bypasses `nn.MultiheadAttention.forward`/`scaled_dot_product_attention`
+entirely. Fixed with the documented workaround, `torch.backends.mha.set_fastpath_enabled(False)`,
+set once at module import time in `pcr/models/relation_blocks.py` -- confirmed this repo's only
+`nn.TransformerEncoder` user, so nothing else is affected, and confirmed the flag only changes
+`.eval()`-mode behavior (the fast path never engages in `.train()` mode in the first place, so
+Stage 1's live training numerics are completely unaffected by this fix).
+
+**Verified**:
+1. Isolated CPU checks (no dataset/GPU needed): `_visibility_attn_bias` shape; VAB's zero-gate
+   no-op property holds regardless of masking; VAB/TAB masking measurably changes output vs. a
+   uniform-visibility control (not silently inert); gradients finite through both blocks; the
+   zero-visibility edge case stays finite (`eps` clamp working); `compute_identity_visibility`'s
+   per-identity averaging checked against a hand-computed expected result.
+2. Real end-to-end GPU smoke run of the full chain: Stage 1 (375/375 iterations, fresh
+   `prompt_learner.pth`/`vab.pth`/`identity_visibility.pth`, no NaN/Inf/errors) ->
+   `cache_text_anchors.py` (fresh `text_prototypes.pth`, confirmed fully finite by direct
+   inspection) -> Stage 2 (375/375 iterations, masks + BPA loss active, every loss term finite
+   throughout, no NaN/Inf/errors -- values in the same range as the previous (pre-VAB/TAB-masking)
+   Stage 2 smoke test, confirming the fix didn't change the loss's overall scale/behavior).
+
+Full repo `python -m py_compile` sweep clean.
+
+---
+
+### 2026-08-28 (3) — Stage 1 switched back to `SupConLoss` (from `InfoNCELoss`), per direct user
+### request, after a theoretical comparison of the two for this repo's PK-sampled batches
+
+User asked which loss "sits perfectly" for Stage 1 given this repo already uses PK sampling, since
+SupCon (the loss before this session's earlier `InfoNCELoss` swap) is generally recommended over
+plain InfoNCE for exactly that batch shape. Explained in plain language in-thread, then asked to
+switch back, with one explicit decision confirmed first: keep Stage 1's visibility weighting (the
+per-part loss-weighting mechanism from the 2026-08-27 refactor) rather than reverting to the
+original, pre-weighting SupConLoss verbatim.
+
+**`pcr/loss/clip_supcon_loss.py`** (new, restored from git history at commit `adad610^` and then
+extended): CLIP-ReID's real multi-positive contrastive loss. Unlike the `InfoNCELoss` it replaces,
+needs no per-batch identity deduplication -- its positive mask already tells same-identity rows
+apart from different-identity ones directly, so every image in a PK batch stays a real comparison
+point and contributes to its own identity's gradient (not just one "representative" image per
+identity). Extended with a required `weights` argument (detached, floored at `1e-3`, same
+convention as `CosineAlignLoss`) so Stage 1 keeps its per-part visibility weighting despite the
+loss-mechanism swap. Temperature default restored to `1.0` (SupCon/CLIP-ReID's own original value)
+-- `InfoNCELoss`'s `0.07` was specifically tuned for a single-positive loss, not this one.
+
+**`pcr/loss/clip_infonce_loss.py`** deleted entirely (no callers left, matching this repo's
+established convention of purging unused code rather than leaving it dead).
+
+**`examples/train_relational_prompts.py`**: `supcon(...)` called twice per part (i2t + t2i, with
+the two feature sets swapped), matching `SupConLoss`'s own two-call convention (unlike
+`InfoNCELoss`, which folded both directions into one call) -- `b_labels` doubles as both
+`anchor_labels` and `other_labels` since every image in the batch is compared against every other
+image in the same batch, which is exactly what PK sampling is for.
+
+**`configs/stage1_relational_prompts.yaml`**: `loss.temperature` `0.07` -> `1.0`.
+
+**Docs**: module docstrings in `train_relational_prompts.py`, `pcr/loss/clip_cosine_align_loss.py`,
+`pcr/models/relation_blocks.py`; `README.md`, `METHODOLOGY.md`; `changes.md`'s items 1, "Red flag
+1", and "Red flag 5" updated -- the last of these ("Stage 1's negative pool is much smaller than
+the original design") is now resolved outright, since SupCon compares against the whole batch (32
+images) rather than InfoNCE's deduplicated ~8 unique identities; `IMPROVEMENT_PLAN.md` sections 1
+and 4 updated to match.
+
+**Verified**: isolated forward/backward check (mask correctly gives 4 positives per anchor for a
+PK=4 batch; `weights.grad is None` confirms the detach; all-zero-weight batch stays finite); a real
+one-epoch Stage 1 smoke run (375/375 iterations, loss stable in a sane ~20-22 range, no NaN/Inf/
+errors); `cache_text_anchors.py` run against the resulting `prompt_learner.pth`, producing a fully
+finite `text_prototypes.pth` -- confirming the artifact handoff to Stage 2 is unaffected by this
+loss-only change.
+
+Full repo `python -m py_compile` sweep clean.
+
+---
+
+### 2026-08-28 (4) — Feature vector size changed 512 -> 1024 across the pipeline, per direct user
+### request; found and fixed a real, previously-latent bug along the way
+
+User asked to set the "feature vector size" to 2048 repo-wide. No CLIP text model produces a
+2048-dim embedding (the sizes available are 512/640/768/1024, fixed by each pretrained checkpoint's
+own `text_projection` shape -- confirmed by inspecting `third_party/clip`), and this repo's whole
+design assumes BPBreID's visual embedding size and CLIP's text embedding size are identical, with
+no bridge/projection layer anywhere to reconcile a mismatch. Asked which of three options to take;
+user chose switching CLIP to a 1024-size model (`RN50`) and setting `dim_reduce_output` to match,
+rather than 2048 with a new adapter layer, or leaving the CLIP pipeline at 512 and finding "2048"
+elsewhere (Stage 3's own separate, already-2048 plain ResNet50 in `pcr/models/resnet.py`, unrelated
+to this pipeline).
+
+**Changed to `1024`**: `pcr/models/bpbreid_encoder.py`'s `BPBReIDModelCfg.dim_reduce_output` shared
+default (this also affects Stage 3's `train_uda.py`/`train_usl.py`, which construct
+`BPBReIDModelCfg` without overriding this field at all -- deliberate, so a Stage 2 checkpoint built
+under the new size still loads cleanly into Stage 3 without every weight being silently discarded
+on a shape mismatch; loading a genuinely external, 512-dim bpbreid checkpoint into Stage 3 would
+need this reverted back down for that one load, since Stage 3 has no CLI flag of its own for it).
+`configs/stage0_bpa_segmentation.yaml`, `configs/stage1_relational_prompts.yaml`, and
+`configs/stage2_relational_finetune.yaml`'s own `model.dim_reduce_output`. `configs/
+stage1_relational_prompts.yaml`'s `clip.arch`: `ViT-B/16` -> `RN50`. `ClipTextEncoder`'s and
+`ClipImageEncoder`'s own constructor defaults (`clip_arch='ViT-B/32'` -> `'RN50'` -- cosmetic only,
+every real caller already passes `cfg.clip.arch` explicitly).
+
+**A real, previously-latent bug found and fixed while verifying this, not a config-value issue**:
+the first real Stage 1 smoke run crashed inside `PromptLearner.build_part_prompts` --
+`RuntimeError: Sizes of tensors must match except in dimension 1. Expected size 512 but got size
+1024`. Root cause: `PromptLearner.__init__` sized its own learnable context tensors
+(`fg_ctx`/`part_ctx`) using `clip_text_encoder.embed_dim` (the text encoder's *final*, post-
+`text_projection` output size -- 1024 for RN50), but those tensors get concatenated with
+`token_prefix`/`token_suffix` (built from `clip_text_encoder.token_embedding`, which outputs
+vectors sized to the transformer's own *internal* width, not `embed_dim`) before ever reaching
+`ClipTextEncoder.forward()`. For ViT-B/16 (the previous default), `transformer_width` and
+`embed_dim` happen to both be 512 -- an accidental coincidence that hid this bug completely, since
+this repo has never used a CLIP arch where those two numbers differ until now. Confirmed directly
+by inspecting a loaded RN50 CLIP model: `transformer.width == 512`, `text_projection.shape ==
+(512, 1024)` -- two different numbers, only one of which (`1024`) is `embed_dim`.
+
+**Fix**: `pcr/models/clip_text_encoder.py::ClipTextEncoder` now exposes both
+`self.embed_dim` (unchanged -- `text_projection.shape[1]`, for anything compared against BPBreID's
+visual output) and a new `self.transformer_width` (`text_projection.shape[0]`, for anything that
+must line up with `token_embedding`/`positional_embedding`/the transformer's own internal
+computation). `pcr/models/prompt_learner.py::PromptLearner.__init__` now sizes `ctx_dim` from
+`transformer_width`, not `embed_dim`.
+
+**Verified with a full real, four-stage smoke chain** (not just the two directly-touched files --
+this bug's blast radius made the whole chain worth re-checking): a fresh Stage 0 run at
+`dim_reduce_output=1024` (1617 iterations, pixel accuracy climbing normally, no NaN); Stage 1
+against that checkpoint with `clip.arch: RN50` (375/375 iterations, loss stable ~20-21, `vab.pth`
+correctly ~4x larger than the old 512-dim version); `cache_text_anchors.py` producing a fully
+finite `[751, 6, 1024]` `text_prototypes.pth`; Stage 2 against all of the above (375/375
+iterations, every loss term finite throughout, checkpoint loaded with zero discarded layers, full
+eval pass completed -- Mean AP 0.9%, expected for a 1-epoch smoke run, not a red flag).
+
+**Docs updated for consistency**: `METHODOLOGY.md`'s `D=512` math notation (5 occurrences) ->
+`D=1024`; `README.md`'s Stage 1 section; `configs/stage1_relational_prompts.yaml`'s and
+`configs/stage2_relational_finetune.yaml`'s own inline comments referencing the old size/arch.
+
+Full repo `python -m py_compile` sweep clean.
+
+---
+
+### 2026-08-28 (5) — Widened Stage 1's SupConLoss negative pool from one PK batch (~8 identities)
+### to the full training set (751 identities / 12936 images), per direct user request
+
+User pointed at `IMPROVEMENT_PLAN.md` section 4's own residual concern: even after the SupCon
+restoration (entry above) fixed InfoNCE's self-inflicted waste, Stage 1's comparison pool per step
+was still capped at one PK batch's worth of identities (~8) -- far short of "CLIP-ReID's full
+~751-identity classification" the user explicitly wanted matched, since a weak Stage 1 signal caps
+what Stage 2 can recover regardless of any later fix. Asked to implement this cleanly in Stage 1.
+
+**Key realization enabling a clean fix, not a queue**: Stage 1's visual encoder (BPBreID
+backbone + BPAM) is completely frozen throughout Stage 1 -- `cached_features`/`cached_labels`,
+already built once for the whole training set before training starts, are therefore never stale.
+That makes a MoCo/SimCLR-style FIFO queue (`IMPROVEMENT_PLAN.md`'s original "Option B" sketch)
+unnecessary for the visual/t2i side: the full 12936-image cache can be used directly, every
+iteration, with zero staleness concern and zero new hyperparameters. Only the text side is a
+genuine moving target (part_ctx/TAB are what Stage 1 actually trains), so that side needs a
+snapshot-refresh strategy instead of a queue.
+
+**`examples/train_relational_prompts.py`**:
+- New `build_text_snapshot(prompt_learner, text_encoder, num_identities, num_parts,
+  identity_visibility, id_batch)`: rebuilds a `[num_identities, K, D]` text-anchor table once per
+  epoch, under `no_grad`, against that epoch's current `part_ctx`/TAB weights -- structurally the
+  same computation `cache_text_anchors.py` already does once at the very end of training, just run
+  once per epoch mid-training instead. Confirmed safe to batch in chunks of `id_batch` identities:
+  `TextualAttentionBlock`'s self-attention only mixes tokens within one identity's own sequence,
+  never across the batch dimension, so chunked construction is exactly equivalent to building every
+  identity one at a time.
+- Training loop, per iteration: builds `in_batch`/`other_ids` (which of the `num_identities` are
+  present in this PK batch vs. not), then for each part `k`:
+  - **i2t**: `other_text = cat([part_text (fresh, differentiable), text_snapshot[other_ids, k, :]
+    (detached)])`, `other_text_labels = cat([b_labels, other_ids])` -- full `num_identities`-way
+    classification, with gradient still reaching `part_ctx`/TAB correctly for the identities
+    actually in this batch (negatives from identities not in this batch don't need to be
+    differentiable, since they'll get their own gradient on whichever future iteration they *are*
+    in the batch -- the same principle sampled-softmax/negative-sampling methods already rely on).
+  - **t2i**: `supcon(part_text, cached_features[:, 1+k, :], b_labels, cached_labels, w_k)` directly
+    -- the entire cached dataset, no snapshot or splicing needed at all.
+- Epoch loop now calls `build_text_snapshot(...)` once at the top of each epoch (`prompt_learner`
+  briefly in `.eval()` inside that call, explicitly switched back to `.train()` immediately after,
+  before any real training step runs).
+
+**No new config knob added** -- the widened pool size is just `num_identities`/`num_images`, both
+already known quantities, unlike a queue's own `queue_size` hyperparameter.
+
+**Verified**:
+1. Isolated checks (no GPU dataset needed beyond a real CLIP load): `build_text_snapshot` produces
+   a correctly-shaped, fully finite `[num_identities, K, D]` tensor; the batch/snapshot splicing
+   logic (`in_batch`/`other_ids`) produces no overlap between an iteration's "fresh" identities and
+   its "other" (snapshot) identities, confirmed against a hand-picked PK batch.
+2. Real 2-epoch Stage 1 smoke run (`batch_size=8`, RN50/1024-dim): both epochs completed cleanly,
+   no NaN/Inf/errors anywhere in the log. Loss jumped from the pre-widening ~20-21 range to ~58-80
+   (expected -- this is now a genuinely harder 751-way / 12936-way classification, not merely a
+   differently-scaled version of the old ~8-way one) and visibly decreased within the very first
+   epoch (79.9 -> 58.0), showing real learning against the larger task. Per-epoch wall time
+   unchanged from the pre-widening run (~23s both before and after) -- confirms the once-per-epoch
+   snapshot rebuild and the larger (but still tiny relative to a backbone forward pass) matmuls add
+   negligible overhead.
+3. `cache_text_anchors.py` run against the resulting `prompt_learner.pth`, producing a fully finite
+   `[751, 6, 1024]` `text_prototypes.pth` -- the Stage 2 handoff is completely unaffected by this
+   change (Stage 2 never sees any of this widening machinery; it only ever reads the final,
+   already-built prototype table, same as before).
+
+`changes.md`'s "Red flag 5" and `IMPROVEMENT_PLAN.md` section 4 updated from "resolved/largely
+resolved" to fully resolved, describing the actual mechanism implemented.
+
+Full repo `python -m py_compile` sweep clean.
+
+---
+
+### 2026-08-28 (6) — Stage 2: added BNNeck and a 10-epoch LR warmup, per direct user request
+### (both from "Bag of Tricks and a Strong Baseline for Deep Person Re-identification", Luo et al.,
+### CVPRW 2019, "BoT")
+
+Neither is part of "Algorithm 2"'s own literal steps -- both are explicit, user-requested additions
+on top of it, not silent scope creep, and documented as such in the file's own module docstring.
+
+**1. BNNeck** (`pcr/models/bn_neck.py`, new): Stage 2's triplet loss and its id/align losses
+previously read the exact same pooled feature (`combined`), but want it shaped two competing ways
+-- triplet's Euclidean margin wants features spread out, id/align's softmax-style classification
+converges better on a compact, roughly-hyperspherical distribution -- so every step, each loss's
+gradient partially fought the other's.
+
+`PartBNNecks`: one `BatchNorm1d` per branch (bias frozen at zero via
+`bn.bias.requires_grad_(False)`, BoT's own convention -- a following linear classifier already has
+its own bias-like freedom, so a learnable BN shift is redundant with it). In
+`compute_losses()` (`examples/train_relational_finetune.py`): triplet loss keeps reading `combined`
+directly, unchanged; `id_loss` now reads `bn_necks(combined, 0)` (wrapped back to `[B, 1, D]` so
+`PartIdClassifiers`'s own `f_out[:, branch, :]` slicing convention -- shared with Stage 3, not
+touched -- still applies unchanged); `align_loss` now reads `F.normalize(bn_necks(combined,
+branch), p=2, dim=-1)` for each part branch -- the extra L2-normalize (not part of "plain" BNNeck)
+is a deliberate addition: `BatchNorm1d`'s per-dimension rescaling doesn't preserve the roughly-
+unit-norm assumption `CosineAlignLoss`'s fixed-temperature softmax depends on, so this restores it,
+the same "BN then L2-normalize before a cosine-similarity head" pattern ArcFace/CosFace-style heads
+already use.
+
+`bn_necks.parameters()` added to the optimizer's param list; `bn_necks.train()` added alongside
+`encoder.train()`/`vab.train()` each epoch; `bn_necks_state_dict` bundled into the saved checkpoint
+alongside `state_dict`/`vab_state_dict` (nothing downstream reads it yet, matching `vab_state_dict`'s
+own status).
+
+**Scope note, documented in `pcr/models/bn_neck.py`'s own docstring**: BoT's paper also recommends
+using the *post*-BN feature for retrieval at test time, not just training -- not done here, since
+Stage 2's `Evaluator` (`pcr/evaluators.py`) doesn't even apply `VisualAttentionBlock` at test time
+yet (a separate, pre-existing gap predating this change) -- wiring BNNeck into evaluation would
+need that fixed first, and wasn't asked for; this change closes the specific *training-time*
+gradient-interference gap only.
+
+**2. 10-epoch LR warmup**: this file previously used a bare `StepLR` from epoch 0 at full LR,
+straight onto a just-unfrozen backbone with three newly-interacting losses (id/triplet/align) --
+BoT's own ablation flags this combination as a known source of early instability that can leave
+training in a worse basin for good. Replaced `torch.optim.lr_scheduler.StepLR` with
+`WarmupMultiStepLR` (`pcr/utils/lr_scheduler.py`, already used by `examples/train_usl.py` -- no new
+scheduler class needed). New config knobs in `configs/stage2_relational_finetune.yaml`:
+`optim.warmup_epochs: 10`, `optim.warmup_factor: 0.01` (BoT's own reference values -- linear warmup
+starting at 1% of the base LR, over 10 epochs), `milestones=[cfg.optim.step_size]` reproducing the
+exact same single 10x decay the old `StepLR` gave, just with warmup added in front.
+
+**Verified**:
+1. Isolated checks: `PartBNNecks`' bias is frozen (`requires_grad=False`) on every branch;
+   gradient reaches the BN's own weight but never the frozen bias; train/eval mode both produce
+   finite output; branches are independent module instances. `WarmupMultiStepLR` with the new
+   config values produces the expected LR curve (verified numerically): `0.01 x base_lr` at epoch
+   0, linearly ramping to the full `base_lr` at epoch 10, held flat, then a 10x drop exactly at
+   `step_size`.
+2. Real 3-epoch Stage 2 smoke run (RN50/1024-dim, masks + BPA loss active, `step_size`/
+   `warmup_epochs` scaled down to fit inside 3 epochs): completed cleanly end to end, including the
+   periodic eval pass, checkpoint save/reload, and final test -- no NaN/Inf/errors/discarded
+   layers anywhere, all loss magnitudes in the same sane ranges as prior (pre-BNNeck) smoke runs
+   (confirming the align-loss L2-renormalization successfully preserved its calibration).
+3. Directly inspected the saved checkpoint's `bn_necks_state_dict`: `running_var` for branch 0 sits
+   at ~0.0009-0.0016 -- almost exactly `1/1024` (the theoretically expected per-dimension variance
+   of a random unit vector in 1024 dimensions), confirming BN is genuinely tracking real statistics
+   from real, correctly-unit-normalized inputs, not sitting at its untouched 1.0 init; `weight`
+   (learned scale) moved slightly off its 1.0 init, confirming gradient is reaching it; `bias`
+   confirmed exactly 0.0 (frozen) on every branch.
+
+Full repo `python -m py_compile` sweep clean.

@@ -33,6 +33,32 @@ correspondence to that algorithm's own names:
                                unconditional framing) but still optional in code for datasets with
                                no masks on disk (dukemtmc-reid) -- see the config's own comment.
 
+Two additions beyond Algorithm 2's own literal steps, both from "Bag of Tricks and a Strong
+Baseline for Deep Person Re-identification" (Luo et al., CVPRW 2019, "BoT") -- explicit, deliberate
+deviations, not silent scope creep:
+
+  BNNeck                       PartBNNecks (pcr/models/bn_neck.py) -- one BatchNorm1d per branch,
+                               inserted between the pooled feature (`combined`) and whichever of
+                               id_loss/align_loss consumes it, so triplet (which keeps reading
+                               `combined` directly, pre-BN) and id/align (which read the post-BN
+                               version) stop fighting over what shape the one shared feature should
+                               have. See that file's own docstring for the full mechanism, including
+                               why align_loss's post-BN input is additionally L2-normalized (BN
+                               alone doesn't preserve the unit-norm assumption CosineAlignLoss's
+                               fixed-temperature softmax depends on -- an ArcFace/CosFace-style
+                               "BN then L2-normalize before a cosine-similarity head" pattern, not
+                               an extra trick layered on top of BNNeck).
+  10-epoch linear warmup        Algorithm 2's own step 16 says nothing about a learning-rate
+                               schedule at all; this file previously used a bare StepLR from epoch
+                               0 at full LR, straight onto a just-unfrozen backbone with three
+                               newly-interacting losses (id/triplet/align) -- exactly the situation
+                               BoT's own ablation warns is a known source of early instability that
+                               can leave training in a worse basin for good. Replaced with
+                               WarmupMultiStepLR (pcr/utils/lr_scheduler.py, already used by
+                               examples/train_usl.py) -- linear warmup for cfg.optim.warmup_epochs
+                               (default 10, BoT's own number), then the same step-decay-at-
+                               cfg.optim.step_size behavior as before.
+
 Loss combination in compute_losses() matches Algorithm 2 step 16 exactly: L_attn + L_id_global +
 L_tri_global + L_tri_parts + lambda_clip * L_align, where lambda_clip is cfg.loss.align_weight --
 the one term the algorithm gives its own explicit coefficient; every other term uses an implicit
@@ -53,17 +79,20 @@ upstream image-level filter Stage 1/2 both used to run (pcr/utils/visibility_fil
 see progress.md's entry on this change) before either stage's training set was ever built: that
 filter discarded 61% of Market1501's training images in practice, was the wrong granularity (an
 image with 4 good parts and 1 occluded one lost all 4), and was found to be driven by an
-undertrained BPAM signal rather than genuine occlusion. VisualAttentionBlock itself still does no
-masking of any kind (see pcr/models/relation_blocks.py's own docstring and changes.md's entry on
-this -- a deliberate, separately-tracked scope limit, not fixed by this change).
+undertrained BPAM signal rather than genuine occlusion. VisualAttentionBlock is also now
+visibility-aware at the attention level itself (see pcr/models/relation_blocks.py's own docstring):
+this forward pass's own vis[:, 1:] is passed into vab() as a soft attention-score bias, so a
+poorly-visible part contributes less as a key to every other part's post-attention representation,
+not just less to its own downstream loss term.
 
-End-of-training checkpoint (Algorithm 2 step 20) bundles VisualAttentionBlock's state into the
-SAME saved dict as the encoder's own state ('vab_state_dict' alongside 'state_dict'), rather than
-a separate vab.pth -- one checkpoint containing {backbone, BPAM, VRB}, directly loadable by the
-existing examples/train_uda.py --checkpoint-path / examples/train_usl.py --checkpoint-path
-unchanged (both only ever read the 'state_dict' key, ignoring the rest -- confirmed against
-bpbreid's own load_pretrained_weights). Stage 3 stays completely out of this file's scope
-otherwise; nothing downstream reads 'vab_state_dict' yet.
+End-of-training checkpoint (Algorithm 2 step 20) bundles VisualAttentionBlock's and PartBNNecks'
+state into the SAME saved dict as the encoder's own state ('vab_state_dict'/'bn_necks_state_dict'
+alongside 'state_dict'), rather than separate files -- one checkpoint containing {backbone, BPAM,
+VRB, BNNeck}, directly loadable by the existing examples/train_uda.py --checkpoint-path /
+examples/train_usl.py --checkpoint-path unchanged (both only ever read the 'state_dict' key,
+ignoring the rest -- confirmed against bpbreid's own load_pretrained_weights). Stage 3 stays
+completely out of this file's scope otherwise; nothing downstream reads 'vab_state_dict' or
+'bn_necks_state_dict' yet.
 
 Renamed from train_finetune.py -- paired with train_relational_prompts.py's rename.
 
@@ -86,6 +115,7 @@ from torch.utils.data import DataLoader
 
 from pcr import datasets
 from pcr.models.bpbreid_encoder import BPBReIDEncoder, BPBReIDModelCfg
+from pcr.models.bn_neck import PartBNNecks
 from pcr.models.id_classifier import PartIdClassifiers
 from pcr.models.relation_blocks import VisualAttentionBlock
 from pcr.loss import PartTripletLoss, CrossEntropyLabelSmooth, CosineAlignLoss, BodyPartAttentionLoss
@@ -96,6 +126,7 @@ from pcr.utils.data import transforms as T
 from pcr.utils.data.sampler import RandomIdentitySampler
 from pcr.utils.data.preprocessor import Preprocessor, PreprocessorMaskedSingleView
 from pcr.utils.logging import Logger
+from pcr.utils.lr_scheduler import WarmupMultiStepLR
 from pcr.utils.osutils import mkdir_if_missing
 from pcr.utils.serialization import save_checkpoint, load_checkpoint
 
@@ -179,7 +210,7 @@ def mask_to_pixel_targets(mask, pixels_cls_scores):
     return mask.argmax(dim=1)
 
 
-def compute_losses(encoder, vab, id_classifiers, triplet_loss, id_loss, align_loss, bpa_loss,
+def compute_losses(encoder, vab, bn_necks, id_classifiers, triplet_loss, id_loss, align_loss, bpa_loss,
                     text_prototypes, imgs, mask, targets, cfg):
     use_masks = bpa_loss is not None
     if use_masks:
@@ -191,8 +222,10 @@ def compute_losses(encoder, vab, id_classifiers, triplet_loss, id_loss, align_lo
     # VisualAttentionBlock mixes the K part branches only; foreground (branch 0) passes through
     # untouched, then the two are recombined into one [B, 1+K, D] tensor so the rest of this
     # function (triplet/align losses) can keep treating "all branches" uniformly, same as before
-    # VAB existed.
-    relation_parts = vab(f_out[:, 1:, :])  # [B, K, D]
+    # VAB existed. vis[:, 1:] is this same forward pass's own per-part visibility, passed in as
+    # VAB's attention bias (see relation_blocks.py's own docstring) -- unlike Stage 1, no separate
+    # per-identity table is needed here: VAB always has a real, fresh per-image signal available.
+    relation_parts = vab(f_out[:, 1:, :], vis[:, 1:])  # [B, K, D]
     combined = torch.cat([f_out[:, 0:1, :], relation_parts], dim=1)  # [B, 1+K, D]
     num_branches = combined.size(1)
 
@@ -205,7 +238,12 @@ def compute_losses(encoder, vab, id_classifiers, triplet_loss, id_loss, align_lo
     log = {}
 
     # Algorithm 2 step 10: L_id_global, the global classifier's cross-entropy on f_g alone.
-    id_logits = id_classifiers(combined, 0)
+    # BNNeck (pcr/models/bn_neck.py): id_loss reads the post-BN feature; triplet (below) keeps
+    # reading `combined` directly, pre-BN. bn_global is [B, D]; wrapped back to [B, 1, D] so
+    # PartIdClassifiers' own f_out[:, branch, :] slicing convention (shared with Stage 3, not
+    # changed here) still applies unchanged.
+    bn_global = bn_necks(combined, 0)
+    id_logits = id_classifiers(bn_global.unsqueeze(1), 0)
     l_id = id_loss(id_logits, targets)
     total = total + cfg.loss.id_weight * l_id
     log['id'] = l_id.item()
@@ -244,7 +282,12 @@ def compute_losses(encoder, vab, id_classifiers, triplet_loss, id_loss, align_lo
         branch_prototypes = text_prototypes[:, branch, :]  # [num_identities, D], full table -- the
                                                              # negatives this loss classifies against
         w = vis[:, branch]  # continuous weighting, not the boolean vis_mask used for triplet
-        align_total = align_total + align_loss(combined[:, branch, :], branch_prototypes, targets, weights=w)
+        # BNNeck again: align_loss reads the post-BN feature too (triplet, above, still reads
+        # combined directly). Re-normalized after BN -- BatchNorm1d's own per-dimension scaling
+        # doesn't preserve the unit-norm assumption CosineAlignLoss's fixed-temperature softmax
+        # depends on, so this restores it (see bn_neck.py's own docstring).
+        bn_part = F.normalize(bn_necks(combined, branch), p=2, dim=-1)
+        align_total = align_total + align_loss(bn_part, branch_prototypes, targets, weights=w)
     total = total + cfg.loss.align_weight * align_total
     log['align'] = align_total.item()
 
@@ -300,6 +343,7 @@ def main_worker(cfg, setup_only=False):
 
     encoder = build_encoder(cfg)
     id_classifiers = PartIdClassifiers(num_identities, cfg.model.dim_reduce_output, branches=(0,)).cuda()
+    bn_necks = PartBNNecks(num_branches, cfg.model.dim_reduce_output).cuda()
 
     vab = VisualAttentionBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.vab.num_heads,
                                num_layers=cfg.vab.num_layers).cuda()
@@ -326,15 +370,24 @@ def main_worker(cfg, setup_only=False):
                   'ON (' + cfg.data.masks_dir + ')' if use_masks else 'off'))
         return
 
-    params = list(encoder.parameters()) + list(id_classifiers.parameters()) + list(vab.parameters())
+    params = (list(encoder.parameters()) + list(id_classifiers.parameters()) + list(vab.parameters())
+              + list(bn_necks.parameters()))
     optimizer = torch.optim.Adam(params, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg.optim.step_size, gamma=0.1)
+    # BoT's own recommended schedule (Luo et al., CVPRW 2019) -- linear warmup for
+    # cfg.optim.warmup_epochs (default 10), starting from cfg.optim.warmup_factor x the base LR,
+    # then the same step decay this file used before (a single drop by 10x at cfg.optim.step_size)
+    # -- see this file's own module docstring for why the warmup was missing before and why that
+    # matters here specifically (freshly-unfrozen backbone, three losses newly interacting).
+    lr_scheduler = WarmupMultiStepLR(optimizer, milestones=[cfg.optim.step_size], gamma=0.1,
+                                      warmup_factor=cfg.optim.warmup_factor,
+                                      warmup_iters=cfg.optim.warmup_epochs, warmup_method='linear')
     evaluator = Evaluator(encoder)
 
     best_mAP = 0
     for epoch in range(cfg.optim.epochs):
         encoder.train()
         vab.train()
+        bn_necks.train()
         train_loader.new_epoch()
         train_iters = len(train_loader)
 
@@ -350,7 +403,7 @@ def main_worker(cfg, setup_only=False):
             targets = targets.cuda()
 
             optimizer.zero_grad()
-            loss, log = compute_losses(encoder, vab, id_classifiers, triplet_loss, id_loss,
+            loss, log = compute_losses(encoder, vab, bn_necks, id_classifiers, triplet_loss, id_loss,
                                         align_loss, bpa_loss, text_prototypes, imgs, mask, targets, cfg)
             loss.backward()
             optimizer.step()
@@ -383,6 +436,7 @@ def main_worker(cfg, setup_only=False):
             save_checkpoint({
                 'state_dict': encoder.model.state_dict(),
                 'vab_state_dict': vab.state_dict(),
+                'bn_necks_state_dict': bn_necks.state_dict(),
                 'epoch': epoch + 1,
                 'best_mAP': best_mAP,
                 'optimizer': optimizer.state_dict(),

@@ -42,7 +42,15 @@ class PromptLearner(nn.Module):
     def __init__(self, num_identities, num_parts, clip_text_encoder, n_ctx=4,
                  tab_num_heads=4, tab_num_layers=1, device='cuda'):
         super(PromptLearner, self).__init__()
-        ctx_dim = clip_text_encoder.embed_dim
+        # transformer_width, NOT embed_dim -- these tokens get concatenated with token_prefix/
+        # token_suffix below (built from clip_text_encoder.token_embedding, which outputs
+        # transformer_width-sized vectors) and fed through the transformer itself, which also
+        # operates at transformer_width throughout; embed_dim (the *final*, post-text_projection
+        # size that must match BPBreID's dim_reduce_output) only applies to ClipTextEncoder's own
+        # output, after this class is done. See clip_text_encoder.py's own docstring -- ViT-B/16
+        # has transformer_width == embed_dim (both 512), which is why using embed_dim here never
+        # broke anything until this repo switched to RN50 (512 vs. 1024).
+        ctx_dim = clip_text_encoder.transformer_width
         dtype = clip_text_encoder.dtype
 
         ctx_init = "A photo of a " + " ".join(["X"] * n_ctx) + " person."
@@ -60,7 +68,8 @@ class PromptLearner(nn.Module):
         nn.init.normal_(part_vectors, std=0.02)
         self.part_ctx = nn.Parameter(part_vectors)
 
-        self.tab = TextualAttentionBlock(ctx_dim, num_heads=tab_num_heads, num_layers=tab_num_layers)
+        self.tab = TextualAttentionBlock(ctx_dim, n_ctx=n_ctx, num_heads=tab_num_heads,
+                                          num_layers=tab_num_layers)
         self.prompt_dtype = dtype
 
         # not trained, but must move with the module (.cuda()/.to()) -- registered as buffers
@@ -82,15 +91,19 @@ class PromptLearner(nn.Module):
         suffix = self.token_suffix.expand(b, -1, -1)
         return torch.cat([prefix, ctx, suffix], dim=1)
 
-    def build_part_prompts(self, labels):
-        """labels: [B] identity indices. Returns a list of `num_branches` tensors, each
-        [B, 77, ctx_dim] -- index 0 is the foreground prompt (built from the unmixed fg_ctx),
-        indices 1..K are the K part prompts (built from part_ctx after one shared
-        TextualAttentionBlock pass mixes all K parts' context together, then sliced back apart)."""
+    def build_part_prompts(self, labels, part_visibility):
+        """labels: [B] identity indices. part_visibility: [B, num_parts], each identity's mean
+        per-part visibility (see examples/train_relational_prompts.py's
+        compute_identity_visibility and relation_blocks.py's own docstring for why this is a
+        per-identity, not per-image, signal) -- passed straight through to TextualAttentionBlock
+        as a soft attention bias. Returns a list of `num_branches` tensors, each [B, 77, ctx_dim]
+        -- index 0 is the foreground prompt (built from the unmixed fg_ctx), indices 1..K are the
+        K part prompts (built from part_ctx after one shared TextualAttentionBlock pass mixes all
+        K parts' context together, then sliced back apart)."""
         fg = self._splice(self.fg_ctx[labels].type(self.prompt_dtype))
 
         raw_part_ctx = self.part_ctx[labels]  # [B, K*n_ctx, ctx_dim], fp32 -- matches tab's fp32 params
-        mixed_part_ctx = self.tab(raw_part_ctx).type(self.prompt_dtype)  # cast only after tab, like fg
+        mixed_part_ctx = self.tab(raw_part_ctx, part_visibility).type(self.prompt_dtype)  # cast after tab, like fg
         parts = []
         for k in range(self.num_parts):
             start = k * self.n_ctx

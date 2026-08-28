@@ -5,7 +5,7 @@ from .crossentropy import CrossEntropyLabelSmooth
 from .part_triplet_loss import PartTripletLoss
 from .gilt_loss import PartGiLtLoss
 from .body_part_attention_loss import BodyPartAttentionLoss
-from .clip_infonce_loss import InfoNCELoss
+from .clip_supcon_loss import SupConLoss
 from .clip_cosine_align_loss import CosineAlignLoss
 
 __all__ = [
@@ -14,6 +14,6 @@ __all__ = [
     'PartTripletLoss',
     'PartGiLtLoss',
     'BodyPartAttentionLoss',
-    'InfoNCELoss',
+    'SupConLoss',
     'CosineAlignLoss',
 ]

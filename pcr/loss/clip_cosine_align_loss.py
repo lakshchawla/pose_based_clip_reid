@@ -7,8 +7,8 @@ flag 4" and IMPROVEMENT_PLAN.md section 3 for the full rationale: a loss with no
 all can be minimized by letting every identity's features drift toward each other, which is exactly
 backwards for re-identification.
 
-Per-sample `weights` (required, not optional -- same convention as pcr/loss/clip_infonce_loss.py's
-InfoNCELoss): a branch with low visibility for a given sample contributes proportionally less to
+Per-sample `weights` (required, not optional -- same convention as pcr/loss/clip_supcon_loss.py's
+SupConLoss): a branch with low visibility for a given sample contributes proportionally less to
 that branch's own alignment term. Explicitly detached before use (`weights.detach()`) -- IMPROVEMENT_
 PLAN.md section 1 / changes.md's "Red flag 1": examples/train_relational_finetune.py's own encoder
 construction switches to continuous (differentiable) visibility scores, so without detaching here,

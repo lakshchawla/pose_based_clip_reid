@@ -7,47 +7,27 @@ still pending).
 
 ## Changes to be done
 
-### 1. Stage 1's per-part loss is still symmetric (i2t + t2i), now via `InfoNCELoss`
+### 1. Stage 1's per-part loss is symmetric (i2t + t2i) -- back to `SupConLoss` as of 2026-08-28
 
-`SupConLoss` has been replaced with `pcr/loss/clip_infonce_loss.py::InfoNCELoss` (per direct user
-request), resolving the loss-*type* half of what this entry used to flag. The loss is still
-computed symmetrically internally (`InfoNCELoss.forward` returns `loss_i2t + loss_t2i`), while
-"Algorithm 1"'s own step 15 specifies one direction only (`InfoNCE(relation_feats[:,k], t_i^k)`).
-Kept symmetric since that wasn't part of the loss-type request and matches this repo's established
-convention (CLIP-ReID/CLIP's own symmetric training loop) -- but it's still a real deviation from
-the algorithm's literal wording, doubling the number of loss terms per part (2 instead of 1).
+Stage 1 briefly used `InfoNCELoss` (a literal, single-positive loss matching "Algorithm 1" step
+15's own wording), then switched back to `SupConLoss` (CLIP-ReID's real, multi-positive loss) --
+see `progress.md`'s entries on both changes for the full reasoning: SupCon needs no patch to work
+with PK-sampled batches, while InfoNCE needed one that wasted most of a batch's own signal. SupCon
+has always been symmetric (loss_i2t + loss_t2i, via two calls with the two feature sets swapped --
+see that file's own docstring), which is CLIP-ReID's own original design, not an extra deviation
+layered on top. "Algorithm 1"'s own step 15 still specifies one direction only
+(`InfoNCE(relation_feats[:,k], t_i^k)`), so the underlying question below is unchanged regardless
+of which of these two losses is in use.
 
-**Decision needed**: keep symmetric (current behavior), or switch to single-direction only
-(visual->text) to match the algorithm literally.
+**Decision needed**: keep symmetric (current behavior, and CLIP-ReID's own convention), or switch
+to single-direction only (visual->text) to match the algorithm literally.
 
-### 2. `VisualAttentionBlock` (and `TextualAttentionBlock`) still perform fully unmasked
-self-attention over possibly-invisible part tokens
+### 2. ~~`VisualAttentionBlock` (and `TextualAttentionBlock`) still perform fully unmasked
+self-attention over possibly-invisible part tokens~~ -- FIXED 2026-08-28
 
-The upstream image-level visibility filter (`pcr/utils/visibility_filter.py::filter_by_visibility`,
-now deleted) has been replaced by per-part *weighting* inside Stage 1/2's own loss functions
-(`InfoNCELoss`, `CosineAlignLoss`, and a loose boolean exclusion in `PartTripletLoss`) -- every
-image, including ones where every part reads as invisible, now enters training; see `progress.md`'s
-entry on this refactor for the full mechanism. `VisualAttentionBlock`/`TextualAttentionBlock`'s own
-bidirectional self-attention over the K part tokens (`pcr/models/relation_blocks.py`) is
-deliberately left untouched by this refactor: both still mix all K tokens completely
-unconditionally, with no visibility-awareness of any kind. A genuinely-occluded part's
-near-garbage pooled feature is therefore still blended, at full and equal weight, into every
-other part's post-attention representation *before* any loss ever sees a token or gets a chance
-to discount it -- the loss-level weighting introduced by this refactor only discounts a poorly-
-visible part's own direct contribution to InfoNCE/align/triplet, it cannot undo contamination VAB
-already mixed into its neighboring parts upstream of the loss.
-
-This was a deliberate scope limit confirmed directly with the user, not an oversight: fixing it
-would mean threading per-branch visibility into VAB/TAB's own attention computation (e.g. an
-additive per-key attention-score bias proportional to `log(visibility)`, or something like
-`nn.TransformerEncoderLayer`'s own `src_key_padding_mask` mechanics adapted to a soft score rather
-than a hard pad mask), which is out of scope here.
-
-**Decision needed**: whether/how to make VAB (and, symmetrically, TAB) visibility-aware in a
-future pass, or whether loss-level weighting alone is judged sufficient once BPAM itself is
-properly trained (60 epochs, per the original plan, not the current 1-epoch smoke test that
-produced the training-collapse signature motivating this whole refactor) and visibility scores
-stop being degenerate in the first place.
+Both blocks now use each part's own reliability as a soft attention bias -- see `progress.md`'s
+entry on this fix (and "Red flag 6" below, which tracked the same issue in plain language) for the
+full mechanism, including a real PyTorch fast-path bug found and fixed along the way.
 
 ## Red flags found in review (2026-08-27, plain language)
 
@@ -62,9 +42,9 @@ math and paper references are in `IMPROVEMENT_PLAN.md`.
 Stage 2's `CosineAlignLoss` now detaches its visibility weight before using it
 (`weights.detach().clamp(...)`), closing the gradient path that let the model lower a part's own
 visibility score instead of actually improving that part's alignment. See `progress.md`'s entry on
-this fix for the full before/after and verification. `InfoNCELoss` (Stage 1) still has the same
-weight-detach applied only implicitly (via its no-grad caching design, not the loss class itself)
--- carrying the explicit `.detach()` over there too remains a cheap, not-yet-done follow-up.
+this fix for the full before/after and verification. Stage 1's loss (`SupConLoss`, restored
+2026-08-28) does the same detach directly in its own `forward` -- not left as a follow-up, since
+the class was rewritten anyway as part of the SupCon restoration.
 
 ### 2. A body part can go completely silent in training with no further warning
 
@@ -105,31 +85,28 @@ version's max of ~10), so `loss.align_weight` (currently `0.5` in
 `configs/stage2_relational_finetune.yaml`) may need retuning down once real training starts, or the
 align term will dominate the total loss more than "Algorithm 2" intended.
 
-### 5. Stage 1's "who counts as a negative example" pool is much smaller than the original design
+### 5. ~~Stage 1's "who counts as a negative example" pool is much smaller than the original design~~ -- FULLY RESOLVED 2026-08-28
 
-**What's wrong**: Stage 1's `InfoNCELoss` avoids a same-identity-treated-as-negative bug by only
-comparing the *unique* identities present in the current batch. With this repo's current batch
-settings (32 images, 4 per identity), that's only about 8 identities compared against each other
-per training step -- far fewer than, e.g., comparing against all ~751 identities in the training
-set. Fewer negatives per step is a weaker, noisier training signal (telling 8 people apart is a
-much easier task than telling 751 apart).
+Originally about `InfoNCELoss`'s own patch for surviving PK-sampled batches: it had to shrink its
+comparison down to only the *unique* identities in a batch (~8), throwing away most of a batch's
+own signal. Stage 1 switched back to `SupConLoss` (fixing the waste), then was widened further to
+close the remaining gap this item was still flagging: Stage 1 now compares every image against
+*every* training identity's text anchor (751, not ~8) and every text prompt against *every* cached
+training image (12936, not one batch's worth) -- matching CLIP-ReID's own original full-identity-
+table design exactly. See `IMPROVEMENT_PLAN.md` section 4 and `progress.md`'s entry on this change
+for the full mechanism (`examples/train_relational_prompts.py::build_text_snapshot`).
 
-**Where**: `pcr/loss/clip_infonce_loss.py`; `configs/stage1_relational_prompts.yaml`'s
-`data.batch_size` / `data.num_instances`.
+### 6. ~~Unmasked attention blocks spread bad information into good parts, not just their own loss term~~ -- FIXED 2026-08-28
 
-**Fix**: see `IMPROVEMENT_PLAN.md` section 4 for two options (bigger PK batches, or a small memory
-bank of past batches' text anchors to widen the negative pool without a bigger batch).
+Both `VisualAttentionBlock` and `TextualAttentionBlock` now use each part's own reliability as a
+soft attention bias, so a poorly-visible part contributes less as a "key" to every other part's
+mixed representation -- see `progress.md`'s entry on this fix for the full mechanism (and item 2 in
+"Changes to be done" above, whose scope limit this resolves).
 
-### 6. Unmasked attention blocks spread bad information into good parts, not just their own loss term
-
-This is the mechanism behind why item 2 in "Changes to be done" above (VAB/TAB doing fully
-unmasked self-attention) is worse than it first sounds. Self-attention doesn't just fail to help an
-occluded part -- it actively blends that part's near-garbage feature into every *other*, perfectly
-visible part's representation, because attention mixes all K parts together unconditionally. A
-single badly-occluded part (say, a bag blocking someone's legs) can quietly degrade the "head,"
-"torso," and "arms" features too, even though those are perfectly visible in the same photo.
-Down-weighting a loss term (what the earlier visibility refactor did) only reduces how much that
-bad part's *own* mistake counts in the loss -- it does nothing to undo the contamination that part
-already spread to its neighbors before the loss ever saw them.
-
-**Fix**: see `IMPROVEMENT_PLAN.md` section 5 for a concrete, visibility-weighted attention fix.
+**A real bug found and fixed while implementing this**: PyTorch's `nn.TransformerEncoderLayer`
+silently switches to a fused native kernel whenever a layer is in `.eval()` mode, and that fused
+kernel produced `NaN` for every part of every identity as soon as a real (non-uniform) attention
+bias was used -- confirmed the masking math itself was correct (the identical computation in
+`.train()` mode, and `.eval()` mode with a uniform/no-op bias, both came out finite). Fixed with
+`torch.backends.mha.set_fastpath_enabled(False)` in `pcr/models/relation_blocks.py` -- a known,
+documented PyTorch workaround, not a change to this repo's own masking logic.

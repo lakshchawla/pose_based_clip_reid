@@ -27,7 +27,7 @@ resulting encoder to an unlabeled target domain.
 | $K$ | Number of learned body parts (default $K=5$) |
 | $M = K+1$ | Number of branches (index $0$ = foreground/global, $1..K$ = parts) |
 | $A_m \in \mathbb{R}^{H\times W}$ | Spatial attention map for branch $m$ |
-| $f_m \in \mathbb{R}^{D}$ | Pooled, L2-normalized embedding for branch $m$ ($D=512$ by default) |
+| $f_m \in \mathbb{R}^{D}$ | Pooled, L2-normalized embedding for branch $m$ ($D=1024$ by default) |
 | $v_m \in \{0,1\}$ or $[0,1]$ | Visibility score for branch $m$ (binary or continuous) |
 | $y_i$ | Identity label of sample $i$ (real label for source/supervised data, pseudo-label for target data under domain adaptation) |
 | $\tau$ | Softmax temperature |
@@ -105,10 +105,10 @@ $$
 The $M_{ctx}$-token context block $[V_\cdot]_{y,m}$ comes from one of two learnable tensors,
 depending on whether $m$ is the foreground branch or a part branch:
 
-- **Foreground** ($m=0$): $[V_\cdot]_{y,0} = C_{fg}[y] \in \mathbb{R}^{M_{ctx}\times 512}$, read
-  directly off a learnable tensor $C_{fg} \in \mathbb{R}^{N_{id}\times M_{ctx}\times 512}$.
+- **Foreground** ($m=0$): $[V_\cdot]_{y,0} = C_{fg}[y] \in \mathbb{R}^{M_{ctx}\times 1024}$, read
+  directly off a learnable tensor $C_{fg} \in \mathbb{R}^{N_{id}\times M_{ctx}\times 1024}$.
 - **Parts** ($m=1..K$): $[V_\cdot]_{y,m} = \mathrm{TAB}\big(C_{part}[y]\big)_m$, where
-  $C_{part} \in \mathbb{R}^{N_{id}\times K \cdot M_{ctx}\times 512}$ is a second learnable tensor
+  $C_{part} \in \mathbb{R}^{N_{id}\times K \cdot M_{ctx}\times 1024}$ is a second learnable tensor
   and $\mathrm{TAB}$ (TextualAttentionBlock, §3.5) is a bidirectional self-attention block run once per
   identity, jointly over all $K$ part branches' context tokens, **before** any individual part's
   prompt is spliced together. This is the mechanism by which each part's prompt is informed by the
@@ -124,7 +124,7 @@ The assembled prompt embedding sequence $p_{y,m}$ is passed through CLIP's (froz
 transformer $g_\theta$ to obtain a text embedding:
 
 $$
-t_{y,m} = \mathrm{L2Norm}\big(g_\theta(p_{y,m})\big) \in \mathbb{R}^{512}
+t_{y,m} = \mathrm{L2Norm}\big(g_\theta(p_{y,m})\big) \in \mathbb{R}^{1024}$
 $$
 
 $g_\theta$'s weights ($\theta$) are never updated during any stage.
@@ -167,7 +167,7 @@ $$
 $$
 
 At the end of Stage 1, a frozen lookup table of per-identity, per-branch text prototypes
-$\bar{T} \in \mathbb{R}^{N_{id}\times M \times 512}$ is pre-computed once (via
+$\bar{T} \in \mathbb{R}^{N_{id}\times M \times 1024}$ is pre-computed once (via
 `examples/cache_text_anchors.py`, run once as a separate script after Stage 1 finishes — recomputing
 this deterministic, frozen forward pass on every Stage-2 step would be wasted work) and cached for
 Stage 2, which also loads VAB's Stage-1-trained weights as its own starting point (§4).
@@ -302,15 +302,26 @@ $$
 \mathcal{L}^{(m)}_{\text{weighted}} = \frac{\sum_i w_{i,m}\, \ell^{(m)}_i}{\sum_i w_{i,m}}, \qquad w_{i,m} = \max(v_m(I_i),\, \epsilon)
 $$
 
-applied to Stage 1's `InfoNCELoss` and Stage 2's `CosineAlignLoss` (both per-part, per-sample
+applied to Stage 1's `SupConLoss` and Stage 2's `CosineAlignLoss` (both per-part, per-sample
 terms — $\epsilon=10^{-3}$ floors every sample's weight so none is ever exactly excluded). Stage
 2's triplet loss is the one exception: batch-hard mining's max/min operations don't compose with
 soft weights, so it keeps a loose *hard* exclusion via `PartTripletLoss`'s own `parts_visibility`
 argument, thresholded at $\lambda_{\text{tri}}=0.05$ — deliberately far looser than the removed
 filter's $\lambda_{v\_min}=0.5$, meant only to drop true degenerate branches, not gate whole
-images. `VisualAttentionBlock`/`TextualAttentionBlock` themselves still perform no masking of any
-kind (§3.5's own description of both blocks is unchanged) — a tracked, deliberate scope limit, not
-addressed by this revision.
+images. `VisualAttentionBlock`/`TextualAttentionBlock` are now visibility-aware at the attention
+level itself (added after this revision — see `progress.md`'s 2026-08-28 entry): each part's own
+reliability score is added as a soft bias to the block's own self-attention scores before the
+softmax,
+
+$$
+\text{score}'_{ij} = \frac{q_i \cdot k_j}{\sqrt{d}} + \log(v_j + \epsilon), \qquad \text{attn}_{ij} = \text{softmax}_j(\text{score}'_{ij})
+$$
+
+so a poorly-visible part contributes less as a *key* to every other part's post-attention
+representation, not just less to its own downstream loss term. VAB uses each image's own real
+per-part visibility; TAB (which has no per-image signal — `PromptLearner.part_ctx` is indexed by
+identity alone) uses each identity's mean visibility across every cached training image of that
+identity instead.
 
 ---
 

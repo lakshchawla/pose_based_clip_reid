@@ -1,7 +1,10 @@
 """Runs once, after examples/train_relational_prompts.py finishes: loads Stage 1's trained
-PromptLearner (which owns TextualAttentionBlock as a submodule), builds every identity's per-branch
-text embedding, and saves the frozen [num_identities, num_branches, embed_dim] lookup table
-Stage 2 (examples/train_relational_finetune.py) actually reads.
+PromptLearner (which owns TextualAttentionBlock as a submodule) and its saved
+identity_visibility.pth (TextualAttentionBlock's per-identity attention bias -- see
+relation_blocks.py's own docstring and train_relational_prompts.py's compute_identity_visibility;
+reused unchanged, not recomputed, so this script's prompts match training exactly), builds every
+identity's per-branch text embedding, and saves the frozen [num_identities, num_branches,
+embed_dim] lookup table Stage 2 (examples/train_relational_finetune.py) actually reads.
 
 Why this is a separate script, not inlined at the end of train_relational_prompts.py the way the
 pre-relational-attention version of this pipeline did it: PromptLearner and TextualAttentionBlock are
@@ -29,14 +32,21 @@ def get_data(name, data_dir):
     return datasets.create(name, osp.join(data_dir, name))
 
 
-def compute_text_prototypes(prompt_learner, text_encoder, num_identities, num_branches, id_batch):
+def compute_text_prototypes(prompt_learner, text_encoder, num_identities, num_branches, id_batch,
+                             identity_visibility):
+    """identity_visibility: [num_identities, num_branches], the exact table
+    examples/train_relational_prompts.py computed and saved -- reused unchanged (not
+    recomputed) so TextualAttentionBlock's attention bias here matches training exactly, keeping
+    part_ctx/TAB's output a deterministic function of identity alone (see relation_blocks.py's own
+    docstring)."""
     prompt_learner.eval()
     text_prototypes = torch.zeros(num_identities, num_branches, text_encoder.embed_dim,
                                    dtype=torch.float32, device='cuda')
     with torch.no_grad():
         for start in range(0, num_identities, id_batch):
             ids = torch.arange(start, min(start + id_batch, num_identities), device='cuda')
-            prompts = prompt_learner.build_part_prompts(ids)  # list of num_branches tensors
+            part_vis = identity_visibility[ids, 1:]  # [b, num_parts], same slice as training
+            prompts = prompt_learner.build_part_prompts(ids, part_vis)  # list of num_branches tensors
             for branch, prompt in enumerate(prompts):
                 text_feat = text_encoder(prompt, prompt_learner.tokenized_prompts)
                 text_prototypes[ids, branch] = text_feat.float()
@@ -66,10 +76,14 @@ def main():
     prompt_learner.load_state_dict(load_checkpoint(prompt_learner_path))
     print('==> Loaded {}'.format(prompt_learner_path))
 
+    identity_visibility_path = osp.join(cfg.logging.logs_dir, 'identity_visibility.pth')
+    identity_visibility = load_checkpoint(identity_visibility_path).cuda()
+
     print('==> Building text-prototype table for {} identities, {} branches'.format(
         num_identities, num_branches))
     text_prototypes = compute_text_prototypes(prompt_learner, text_encoder, num_identities,
-                                               num_branches, cfg.data.cache_batch_size)
+                                               num_branches, cfg.data.cache_batch_size,
+                                               identity_visibility)
 
     out_path = osp.join(cfg.logging.logs_dir, 'text_prototypes.pth')
     torch.save({'text_prototypes': text_prototypes.cpu(), 'num_identities': num_identities,

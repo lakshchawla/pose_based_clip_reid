@@ -9,7 +9,7 @@
 # Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the tab:/vab:
 # sections below are the new content relative to that file. No visibility: section -- the
 # upstream image-level filter this used to configure was removed (see progress.md's entry on
-# this); every image is used, weighted per-part inside InfoNCELoss instead.
+# this); every image is used, weighted per-part inside SupConLoss instead.
 
 model:
   backbone: resnet50          # or resnet50 -- must match Stage 0's own backbone
@@ -17,11 +17,12 @@ model:
   # init -- run examples/train_bpa_segmentation.py first (configs/stage0_bpa_segmentation.yaml)
   # to produce this file.
   checkpoint_path: 'examples/logs/stage0_bpa/model_best.pth.tar'
-  dim_reduce_output: 512     # must equal clip.arch's text embed dim (512 for ViT-B/32 and ViT-B/16)
+  dim_reduce_output: 1024    # must equal clip.arch's text embed dim (1024 for RN50/RN50x64)
   parts_num: 5                # K body parts; num_branches = 1 (foreground) + parts_num
 
 clip:
-  arch: ViT-B/16
+  arch: RN50                  # 1024-dim text embedding, matching model.dim_reduce_output above --
+                                # see pcr/models/clip_text_encoder.py's own docstring for other archs' sizes
   n_ctx: 4                    # learnable context tokens per (identity, branch)
 
 tab:
@@ -57,10 +58,10 @@ optim:
   lr_min: 0.000001
 
 loss:
-  # 0.07 -- CLIP's own established optimal starting temperature (logit_scale = log(1/0.07) in
-  # the original paper and third_party/clip/model.py), not SupConLoss's old temperature=1.0
-  # (tuned for that loss's multi-positive formulation, not InfoNCELoss's single-positive one).
-  temperature: 0.07
+  # 1.0 -- SupConLoss's (and CLIP-ReID's) own original value for this multi-positive loss, not
+  # CLIP's 0.07 (that value is tuned for a plain single-positive contrastive loss -- see
+  # pcr/loss/clip_supcon_loss.py's own docstring for why using the wrong one here would matter).
+  temperature: 1.0
 
 logging:
   logs_dir: examples/logs/stage1_prompts

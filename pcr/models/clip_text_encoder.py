@@ -9,9 +9,26 @@ done in pcr2-run), not CLIP-ReID's own vendored fork under CLIP-ReID/model/clip/
 patched specifically for CLIP-ReID's own ReID visual-encoder resolution/stride interpolation,
 irrelevant here since the visual tower is never built.
 
-ViT-B/32 is the default arch: its text embedding dim is 512, exactly matching
-BPBReIDModelCfg.dim_reduce_output (pcr/models/bpbreid_encoder.py) -- no projection layer needed
-between BPBreID's part embeddings and CLIP's text embeddings for the alignment losses.
+RN50 is the default arch: its text embedding dim (`embed_dim`, the output of `text_projection` --
+what actually gets compared against BPBreID's part embeddings in the alignment losses) is 1024,
+exactly matching BPBReIDModelCfg.dim_reduce_output -- no projection layer needed between BPBreID's
+part embeddings and CLIP's text embeddings there. Any other CLIP arch works too as long as its own
+`embed_dim` is set to match on both sides -- ViT-B/32 and ViT-B/16 are 512, ViT-L/14 and RN50x16 are
+768, RN50x4 is 640, RN101 is 512, RN50x64 is 1024 (same as RN50) -- none of the standard archs
+produce 2048, so there is no way to reach that size through clip_arch choice alone.
+
+`embed_dim` is NOT the same number as this transformer's own internal width (`transformer_width`,
+exposed separately below) -- a real bug this repo hit switching from ViT-B/16 to RN50: ViT-B/16
+happens to have `transformer_width == embed_dim` (both 512), which hid the distinction completely;
+RN50's are different (512 internal, 1024 final, per `third_party/clip/model.py`'s own `CLIP.
+__init__`: `transformer_width` sizes `token_embedding`/`positional_embedding`/the transformer
+itself, while `text_projection` is a separate `[transformer_width, embed_dim]` matrix applied only
+once, after the transformer, to reach the final joint embedding space). `PromptLearner`'s own
+learnable context tokens get concatenated with this class's frozen `token_prefix`/`token_suffix`
+(built from `token_embedding`, i.e. `transformer_width`-sized) *before* they ever reach this
+class's `forward()` -- so they must be sized to `transformer_width`, not `embed_dim`, or that
+concatenation fails outright (see PromptLearner's own docstring for the fix; progress.md has the
+full story of finding this).
 """
 import clip
 import torch
@@ -19,7 +36,7 @@ import torch.nn as nn
 
 
 class ClipTextEncoder(nn.Module):
-    def __init__(self, clip_arch='ViT-B/32', device='cuda'):
+    def __init__(self, clip_arch='RN50', device='cuda'):
         super(ClipTextEncoder, self).__init__()
         clip_model, _ = clip.load(clip_arch, device=device, jit=False)
         self.token_embedding = clip_model.token_embedding
@@ -29,6 +46,11 @@ class ClipTextEncoder(nn.Module):
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
         self.embed_dim = self.text_projection.shape[1]
+        # This transformer's own internal width -- NOT the same as embed_dim above in general (see
+        # this file's own module docstring). Callers that build tokens meant to be concatenated
+        # with token_embedding's own output (PromptLearner's prefix/suffix splicing) must size
+        # those tokens to this, not to embed_dim.
+        self.transformer_width = self.text_projection.shape[0]
 
         for p in self.parameters():
             p.requires_grad_(False)

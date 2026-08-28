@@ -75,11 +75,13 @@ externally-pretrained BPBreID checkpoint, switched to continuous visibility scor
 script's own `build_encoder`) + frozen CLIP text encoder. Trainable: `PromptLearner`
 (per-(identity, branch) learnable prompt context, owning a `TextualAttentionBlock` that mixes the K
 part branches' context together before any part's prompt is built) and a `VisualAttentionBlock`
-(mixes the K part branches' pooled visual features the same way). Every training image is used, no
-upstream filtering -- each part's `InfoNCELoss` term is weighted by that part's own per-image
-visibility score instead (see `pcr/loss/clip_infonce_loss.py`; `progress.md` has the full
-rationale for replacing the earlier image-level filter). Produces `prompt_learner.pth` and
-`vab.pth` under `logging.logs_dir`.
+(mixes the K part branches' pooled visual features the same way) -- both blocks' own self-attention
+is visibility-aware too (a poorly-visible part counts less as a key others attend to), not just the
+loss below. Every training image is used, no upstream filtering -- each part's `SupConLoss` term is
+weighted by that part's own per-image visibility score instead (see `pcr/loss/clip_supcon_loss.py`;
+`progress.md` has the full rationale for replacing the earlier image-level filter). Produces
+`prompt_learner.pth`, `vab.pth`, and `identity_visibility.pth` (TextualAttentionBlock's per-identity
+attention bias) under `logging.logs_dir`.
 
 ```bash
 python examples/cache_text_anchors.py --config configs/stage1_relational_prompts.yaml

@@ -18,7 +18,7 @@ import torch.nn as nn
 
 
 class ClipImageEncoder(nn.Module):
-    def __init__(self, clip_arch='ViT-B/32', device='cuda'):
+    def __init__(self, clip_arch='RN50', device='cuda'):
         super(ClipImageEncoder, self).__init__()
         clip_model, _ = clip.load(clip_arch, device=device, jit=False)
         self.visual = clip_model.visual

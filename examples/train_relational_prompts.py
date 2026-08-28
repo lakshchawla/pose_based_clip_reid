@@ -17,18 +17,37 @@ correspondence to that algorithm's own names:
                               use at all; this script trains part_ctx only, see below)
   VRB                        VisualAttentionBlock (pcr/models/relation_blocks.py)
   TRB                        TextualAttentionBlock (owned by PromptLearner, same file)
-  InfoNCE                    InfoNCELoss (pcr/loss/clip_infonce_loss.py) -- literal single-
-                              positive InfoNCE, matching the algorithm's own step 15 wording,
-                              replacing the earlier `SupConLoss` (CLIP-ReID's multi-positive
-                              contrastive loss, removed -- this was its only caller). Per direct
-                              user request. Naive diagonal InfoNCE over a raw PK-sampled batch
-                              would reproduce the exact collision that made the earlier
-                              train_relational_clip.py underperform (same-identity images treated
-                              as false negatives) -- InfoNCELoss avoids this by deduplicating to
-                              unique identities before building the negative set on both
-                              directions; see that file's own docstring for the full mechanism.
-                              Temperature is a fixed constant (0.07 by default, CLIP's own
-                              established optimal starting value), not learned.
+  InfoNCE                    SupConLoss (pcr/loss/clip_supcon_loss.py) -- CLIP-ReID's actual,
+                              multi-positive contrastive loss, restored 2026-08-28 after a
+                              round-trip through a literal single-positive `InfoNCELoss` (removed)
+                              that matched Algorithm 1 step 15's own wording more closely, but
+                              fit this file's PK-sampled batches worse: InfoNCE needed a
+                              deduplication patch to avoid treating a person's own other photos in
+                              the batch as false negatives, and that patch meant only one
+                              representative photo per identity ever shaped the text-side
+                              gradient, and the comparison shrank to only the unique identities in
+                              one batch (~8). SupCon needs no such patch -- its positive mask
+                              already recognizes same-identity rows as positives directly, so
+                              every photo in the batch stays a comparison point and contributes to
+                              its identity's gradient, not just one representative. See that
+                              file's own docstring for the full mechanism and why this is the
+                              better fit specifically because this file uses PK sampling on
+                              purpose. Temperature restored to `1.0` (SupCon's own original value)
+                              alongside the loss swap -- `0.07` was tuned for InfoNCE's
+                              single-positive shape, not this one.
+
+                              Widened further, 2026-08-28: the comparison pool on both sides of
+                              SupCon is no longer restricted to the current PK batch. i2t compares
+                              each image against *every* training identity's text anchor (not just
+                              the ~8 in the current batch) via build_text_snapshot's once-per-epoch
+                              full-identity table, spliced with this batch's own fresh/
+                              differentiable rows; t2i compares each text prompt against *every*
+                              cached image in the training set (cached_features never goes stale --
+                              the backbone/BPAM are frozen for all of Stage 1). This is what
+                              matches CLIP-ReID's own original design (full-identity-table
+                              classification), which a single PK batch alone cannot reach no
+                              matter how it's sampled -- see IMPROVEMENT_PLAN.md section 4 and
+                              progress.md's entry on this change.
 
 Deliberately NOT in this script, matching Algorithm 1 exactly (steps 8, 15-16 extract BPAM's
 global/foreground feature f_g but never use it again, and the loss sum is over K parts only, no
@@ -39,11 +58,9 @@ is a known, flagged consequence of scoping this fix to Stage 1 only, not somethi
 silently works around.
 
 Batches are genuinely PK-sampled from the cached feature set (build_pk_batches, below) --
-Algorithm 1 step 6, and not just a label change from the previous plain-random-sub-batch version:
-even with InfoNCELoss's per-identity deduplication making it safe against PK-batch collisions,
-PK sampling still means every anchor is far more likely to share its batch with useful additional
-signal (other views of related identities feeding the same TAB/VAB mixing step) than a plain
-random batch would give -- and matches Algorithm 1's own step 6 regardless of loss-type specifics.
+Algorithm 1 step 6, and now the very thing SupConLoss's own multi-positive mechanism is built to
+use: every identity's several images in a batch become several positives contributing to the same
+gradient, not merely "extra useful context" the way it was framed under InfoNCE.
 
 The whole training set's part-embeddings are cached once under no_grad before the training loop
 starts (BPBreID/BPAM are frozen throughout, so nothing about them changes step to step) -- PK
@@ -54,32 +71,37 @@ every image in the dataset is cached and trained on, no exceptions (see below fo
 No hard per-branch visibility gating anywhere -- every branch contributes for every cached
 sample, unconditionally. Reliability is instead handled by *weighting*, not exclusion:
 build_encoder (below) switches this stage's own encoder to continuous (not binary) visibility
-scores, and each part's own InfoNCELoss call is weighted by that part's own per-image visibility
+scores, and each part's own SupConLoss call is weighted by that part's own per-image visibility
 (cached alongside the features, in cached_visibility) -- a poorly-visible part contributes
 proportionally less to its own loss term instead of the whole image being rejected outright. This
 replaces the upstream image-level filter this file used to run (pcr/utils/visibility_filter.py,
 deleted -- see progress.md's entry on this change): that filter discarded 61% of Market1501's
 training images in practice, was the wrong granularity (an image with 4 good parts and 1 occluded
 one lost all 4), and was found to be driven by an undertrained BPAM signal rather than genuine
-occlusion. VisualAttentionBlock/TextualAttentionBlock themselves still do no masking of any kind
-(see pcr/models/relation_blocks.py's own docstring and changes.md's entry on this -- a deliberate,
-separately-tracked scope limit, not fixed by this change).
+occlusion. VisualAttentionBlock is also now visibility-aware at the attention level itself, not
+just in the loss that consumes its output (see pcr/models/relation_blocks.py's own docstring) --
+each image's own per-part visibility (b_vis, already cached) is passed into vab() as a soft
+attention-score bias, so a poorly-visible part's near-garbage feature contributes less as a KEY to
+every other part's post-attention representation, closing the contamination gap loss-level
+weighting alone could never reach.
 
-No parallel visibility-weighting mechanism exists for the text side (PromptLearner.part_ctx/
-TextualAttentionBlock) -- none is needed. part_ctx is indexed only by identity label
-(build_part_prompts(labels)); it has no per-image input at all, so there's no independent
-"text visibility" to weight. The gradient that reaches part_ctx/TAB through InfoNCELoss's own
-per-image weighting is already an implicitly visibility-weighted aggregate over whichever
-instances of that identity are in the current PK batch -- a heavily-occluded instance
-contributes proportionally less gradient automatically, as a direct consequence of contributing
-less to the (now-weighted) loss value itself. It adapts via the InfoNCE loss alone.
+TextualAttentionBlock has no per-image signal to use the same way -- PromptLearner.part_ctx is
+indexed only by identity label (build_part_prompts(labels, part_visibility)); it has no per-image
+input at all. compute_identity_visibility (below) substitutes each identity's *mean* per-part
+visibility across every cached image of that identity, computed once here and passed into both
+this script's training loop and (via the saved identity_visibility.pth) examples/
+cache_text_anchors.py's own final prompt-building pass, so TAB's output stays a consistent,
+deterministic function of identity alone in both places. The gradient that reaches part_ctx/TAB
+through SupConLoss's own per-image weighting was already an implicitly visibility-weighted
+aggregate over whichever instances of that identity are in the current PK batch; this adds a
+second, complementary mechanism at the attention level itself, mirroring VAB's.
 
-Produces two files consumed by examples/cache_text_anchors.py (not by Stage 2 directly -- see
+Produces three files consumed by examples/cache_text_anchors.py (not by Stage 2 directly -- see
 that script's own docstring for why the final text-prototype computation is a separate step):
 prompt_learner.pth (PromptLearner's state, including TextualAttentionBlock and the untrained
-fg_ctx) and vab.pth (VisualAttentionBlock's state -- unlike the text-side modules, VAB is *not*
-discarded after Stage 1; Stage 2 loads vab.pth to continue training the same
-VisualAttentionBlock instance).
+fg_ctx), vab.pth (VisualAttentionBlock's state -- unlike the text-side modules, VAB is *not*
+discarded after Stage 1; Stage 2 loads vab.pth to continue training the same VisualAttentionBlock
+instance), and identity_visibility.pth (the per-identity mean visibility table described above).
 
 Config-driven (YAML), not argparse -- see configs/stage1_relational_prompts.yaml. This is a
 deliberate deviation from the rest of pcr2 (train_uda.py/train_usl.py stay argparse-only, decided
@@ -103,7 +125,7 @@ from pcr.models.clip_image_encoder import ClipImageEncoder
 from pcr.models.clip_text_encoder import ClipTextEncoder
 from pcr.models.prompt_learner import PromptLearner
 from pcr.models.relation_blocks import VisualAttentionBlock
-from pcr.loss.clip_infonce_loss import InfoNCELoss
+from pcr.loss.clip_supcon_loss import SupConLoss
 from pcr.utils.config import load_yaml_config
 from pcr.utils.data import transforms as T
 from pcr.utils.data.preprocessor import Preprocessor
@@ -143,16 +165,69 @@ def cache_part_features(encoder, data_loader):
     return torch.cat(features, 0), torch.cat(visibilities, 0), torch.cat(labels, 0)
 
 
+def compute_identity_visibility(cached_visibility, cached_labels, num_identities):
+    """cached_visibility: [N, 1+K] (per-image, from cache_part_features). cached_labels: [N].
+    Returns [num_identities, 1+K]: each identity's mean visibility across every cached image of
+    that identity. TextualAttentionBlock has no per-image signal available (PromptLearner.part_ctx
+    is indexed by identity alone -- see relation_blocks.py's own docstring), so this is the
+    per-identity substitute passed into it as its attention bias; saved to disk
+    (identity_visibility.pth) so examples/cache_text_anchors.py can reuse the exact same values
+    when it rebuilds the final frozen prompts, keeping TAB's output a true, consistent function of
+    identity alone rather than depending on which script last computed it."""
+    num_branches = cached_visibility.size(1)
+    sums = torch.zeros(num_identities, num_branches, device=cached_visibility.device)
+    sums.index_add_(0, cached_labels, cached_visibility)
+    counts = torch.zeros(num_identities, device=cached_visibility.device)
+    counts.index_add_(0, cached_labels, torch.ones_like(cached_labels, dtype=cached_visibility.dtype))
+    return sums / counts.unsqueeze(1).clamp(min=1)
+
+
+def build_text_snapshot(prompt_learner, text_encoder, num_identities, num_parts,
+                         identity_visibility, id_batch):
+    """Full-dataset text-anchor snapshot, [num_identities, num_parts, D], rebuilt once at the
+    start of every epoch (not every iteration -- see main_worker's own call site) under no_grad,
+    using the model's CURRENT part_ctx/TextualAttentionBlock weights. This is what widens Stage
+    1's negative pool from "the ~8 identities in one PK batch" to "every identity in the training
+    set", matching CLIP-ReID's own original Stage 1 design (full-identity-table classification,
+    not a batch-restricted one) -- see IMPROVEMENT_PLAN.md section 4 and progress.md's entry on
+    this change for the full reasoning.
+
+    Only used as a *negative* pool for identities NOT present in the current PK batch (see
+    main_worker's own per-iteration splicing) -- an identity that IS in the current batch gets a
+    fresh, differentiable re-encoding instead, since gradient must still reach part_ctx/TAB for it.
+    A once-per-epoch refresh (rather than once per iteration) keeps this affordable: rebuilding it
+    costs one extra CLIP-text forward pass over the whole identity set, not per training step, and
+    a whole epoch's worth of iterations (hundreds) is far more than enough for the small
+    per-iteration drift in part_ctx/TAB to matter for what is, after all, only a negative-comparison
+    pool, not something being directly optimized against.
+
+    TextualAttentionBlock's own attention only mixes tokens *within* one identity's own K*n_ctx-
+    token sequence (standard transformer batching never attends across the batch dimension), so
+    building this in chunks of `id_batch` identities at a time is exactly equivalent to building
+    every identity one at a time -- no cross-identity leakage or batching-order sensitivity."""
+    prompt_learner.eval()
+    D = text_encoder.embed_dim
+    snapshot = torch.zeros(num_identities, num_parts, D, device='cuda')
+    with torch.no_grad():
+        for start in range(0, num_identities, id_batch):
+            ids = torch.arange(start, min(start + id_batch, num_identities), device='cuda')
+            part_vis = identity_visibility[ids, 1:]
+            prompts = prompt_learner.build_part_prompts(ids, part_vis)
+            for k in range(num_parts):
+                text_feat = text_encoder(prompts[1 + k], prompt_learner.tokenized_prompts).float()
+                snapshot[ids, k] = text_feat
+    return snapshot
+
+
 def build_pk_batches(cached_labels, num_instances, batch_size):
     """Groups the cached feature set's indices by identity, then partitions all identities into
     PK batches for one epoch: batch_size // num_instances identities per batch, num_instances
     cached images per identity (sampled with replacement if that identity has fewer than
     num_instances cached images). Algorithm 1 step 6 ("Sample a PK batch of pre-filtered
-    images") -- see this file's own module docstring for why this matters even with InfoNCELoss's
-    per-identity deduplication making it safe against PK-batch collisions. A final partial group
-    of identities (fewer than batch_size // num_instances left over) is dropped, matching this
-    repo's other PK
-    samplers' drop_last convention (pcr/utils/data/sampler.py::RandomIdentitySampler)."""
+    images") -- see this file's own module docstring for why SupConLoss's multi-positive mechanism
+    depends on this. A final partial group of identities (fewer than batch_size // num_instances
+    left over) is dropped, matching this repo's other PK samplers' drop_last convention
+    (pcr/utils/data/sampler.py::RandomIdentitySampler)."""
     labels_np = cached_labels.cpu().numpy()
     id_to_indices = {}
     for idx, pid in enumerate(labels_np):
@@ -181,7 +256,7 @@ def build_encoder(cfg):
     model_cfg.masks.parts_num = cfg.model.parts_num
     model_cfg.dim_reduce_output = cfg.model.dim_reduce_output
     # Continuous visibility scores, not the dataclass's own binary default -- needed for
-    # InfoNCELoss's per-part weighting to be meaningfully graduated rather than near-binary.
+    # SupConLoss's per-part weighting to be meaningfully graduated rather than near-binary.
     # Overridden only here (this stage's own encoder construction), not in BPBReIDModelCfg's
     # shared default -- Stage 3 stays binary, untouched. Stage 1's encoder calls .eval()
     # immediately below and never leaves eval mode, so testing_binary_visibility_score is the
@@ -256,7 +331,12 @@ def main_worker(cfg, setup_only=False):
                   tuple(prompt_learner.fg_ctx.shape)))
         return
 
-    infonce = InfoNCELoss(temperature=cfg.loss.temperature).cuda()
+    # Per-identity mean visibility -- TextualAttentionBlock's attention bias (see
+    # compute_identity_visibility's own docstring and relation_blocks.py for why this differs from
+    # VisualAttentionBlock's per-image one).
+    identity_visibility = compute_identity_visibility(cached_visibility, cached_labels, num_identities)
+
+    supcon = SupConLoss(temperature=cfg.loss.temperature).cuda()
     # fg_ctx deliberately excluded -- Algorithm 1 has no foreground term (see module docstring);
     # only part_ctx, TextualAttentionBlock (prompt_learner.tab), and VisualAttentionBlock train.
     trainable_params = ([prompt_learner.part_ctx] + list(prompt_learner.tab.parameters())
@@ -276,6 +356,12 @@ def main_worker(cfg, setup_only=False):
     scaler = torch.amp.GradScaler('cuda')
 
     for epoch in range(cfg.optim.epochs):
+        # Refresh the full-identity text-anchor snapshot once per epoch, against this epoch's
+        # part_ctx/TAB weights -- see build_text_snapshot's own docstring. Puts prompt_learner in
+        # eval() mode briefly; explicitly switched back to train() below before any real training
+        # step runs.
+        text_snapshot = build_text_snapshot(prompt_learner, text_encoder, num_identities, num_parts,
+                                             identity_visibility, cfg.data.cache_batch_size)
         prompt_learner.train()
         vab.train()
         epoch_loss = 0.0
@@ -294,14 +380,37 @@ def main_worker(cfg, setup_only=False):
 
             # Algorithm 1 steps 10-14: only the K part prompts are built and pushed through the
             # frozen CLIP text encoder -- no foreground prompt/loss (module docstring).
-            prompts = prompt_learner.build_part_prompts(b_labels)  # list of 1+K tensors
-            part_visual = vab(b_features[:, 1:, :])  # [b, K, D], relationally mixed
+            id_vis = identity_visibility[b_labels]  # [b, 1+K], TAB's per-identity bias
+            prompts = prompt_learner.build_part_prompts(b_labels, id_vis[:, 1:])  # list of 1+K tensors
+            part_visual = vab(b_features[:, 1:, :], b_vis[:, 1:])  # [b, K, D], relationally mixed
+
+            # Identities NOT in this batch -- their text row comes from this epoch's (detached)
+            # snapshot instead of a fresh re-encoding, widening i2t's negative pool to the full
+            # training set. See build_text_snapshot's own docstring / IMPROVEMENT_PLAN.md section 4.
+            in_batch = torch.zeros(num_identities, dtype=torch.bool, device=b_labels.device)
+            in_batch[b_labels] = True
+            other_ids = in_batch.logical_not().nonzero(as_tuple=True)[0]
+
+            # Algorithm 1 step 15 (loss_i2t + loss_t2i), via SupConLoss's own two-call convention
+            # (see that file's docstring).
             loss = b_features.new_zeros(())
             for k in range(num_parts):
                 part_text = text_encoder(prompts[1 + k], prompt_learner.tokenized_prompts).float()
                 visual_k = part_visual[:, k, :]
                 w_k = b_vis[:, 1 + k]  # same 1+k branch offset as prompts[1+k]/part_visual[:,k,:]
-                loss = loss + infonce(visual_k, part_text, b_labels, w_k)
+
+                # i2t: full num_identities-way classification, not just this batch's ~8 -- this
+                # batch's own identities keep their fresh, differentiable text row (gradient must
+                # reach part_ctx/TAB for them); every other identity is a detached negative from
+                # this epoch's text_snapshot.
+                other_text = torch.cat([part_text, text_snapshot[other_ids, k, :]], dim=0)
+                other_text_labels = torch.cat([b_labels, other_ids], dim=0)
+                loss = loss + supcon(visual_k, other_text, b_labels, other_text_labels, w_k)
+
+                # t2i: full-dataset classification -- every cached image, not just this batch's,
+                # is a comparison point. No snapshot/splicing needed here at all: cached_features
+                # never goes stale, since the backbone/BPAM are frozen for the whole of Stage 1.
+                loss = loss + supcon(part_text, cached_features[:, 1 + k, :], b_labels, cached_labels, w_k)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -319,8 +428,10 @@ def main_worker(cfg, setup_only=False):
 
     torch.save(prompt_learner.state_dict(), osp.join(cfg.logging.logs_dir, 'prompt_learner.pth'))
     torch.save(vab.state_dict(), osp.join(cfg.logging.logs_dir, 'vab.pth'))
-    print('==> Saved prompt_learner.pth and vab.pth to {}. Run examples/cache_text_anchors.py '
-          'next to build text_prototypes.pth for Stage 2.'.format(cfg.logging.logs_dir))
+    torch.save(identity_visibility.cpu(), osp.join(cfg.logging.logs_dir, 'identity_visibility.pth'))
+    print('==> Saved prompt_learner.pth, vab.pth and identity_visibility.pth to {}. Run '
+          'examples/cache_text_anchors.py next to build text_prototypes.pth for Stage 2.'.format(
+              cfg.logging.logs_dir))
 
     end_time = time.monotonic()
     print('Total running time: ', timedelta(seconds=end_time - start_time))

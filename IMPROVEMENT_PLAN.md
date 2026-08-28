@@ -76,15 +76,15 @@ sample-reweighting literature always does; it's not specific to ReID).
   `training_binary_visibility_score = False`, which is what makes `vis` differentiable in the
   first place -- see `third_party/torchreid/models/bpbreid.py`'s `pixels_parts_probabilities
   .amax(dim=(2, 3))` computation).
-- `pcr/loss/clip_infonce_loss.py`'s `InfoNCELoss` has the identical pattern and should get the
-  same fix for safety, even though it's not currently exploitable (Stage 1's `cached_visibility`
-  is built entirely under `torch.no_grad()`, so there's no live graph today -- but that safety is
-  an accident of the caller, not a guarantee of the loss class itself).
+- Stage 1's loss had the identical pattern in its weights argument. It was `InfoNCELoss` at the
+  time this was first written; Stage 1 has since switched back to `SupConLoss`
+  (`pcr/loss/clip_supcon_loss.py`, restored 2026-08-28 -- see `progress.md`), which was given the
+  same detach directly, from the start, rather than left as a follow-up.
 
 **The fix**: detach the weight before clamping, in both loss classes:
 
 ```python
-# pcr/loss/clip_cosine_align_loss.py and pcr/loss/clip_infonce_loss.py
+# pcr/loss/clip_cosine_align_loss.py and pcr/loss/clip_supcon_loss.py
 w = weights.detach().clamp(min=self.weight_floor)
 ```
 
@@ -92,13 +92,14 @@ One line, in each of the two files. This makes "visibility informs the loss but 
 gradient from it" a property of the loss class itself, not something that depends on every future
 caller remembering to detach upstream.
 
-**Status**: done for `CosineAlignLoss` (`pcr/loss/clip_cosine_align_loss.py`) -- verified with an
-isolated forward/backward check (`weights.grad is None` after `loss.backward()`, confirming the
-leak is closed while gradient still reaches `visual_features`) and a real one-epoch Stage 2 smoke
-run (375 iterations, all loss terms finite throughout, no NaN/Inf). `InfoNCELoss` (Stage 1) was
-left as-is for now -- it's not currently exploitable (its weights come from a `no_grad` caching
-pass, not a live graph), so applying the same one-line detach there remains a cheap, low-priority
-follow-up rather than an active bug.
+**Status**: done in both `CosineAlignLoss` (`pcr/loss/clip_cosine_align_loss.py`) and Stage 1's
+`SupConLoss` (`pcr/loss/clip_supcon_loss.py`) -- verified for `CosineAlignLoss` with an isolated
+forward/backward check (`weights.grad is None` after `loss.backward()`, confirming the leak is
+closed while gradient still reaches `visual_features`) and a real one-epoch Stage 2 smoke run (375
+iterations, all loss terms finite throughout, no NaN/Inf). Not currently exploitable in Stage 1
+either way (`cached_visibility` is built entirely under `torch.no_grad()`, so there's no live graph
+there today), but the detach is now a guarantee of the loss class itself rather than an accident of
+the caller.
 
 ## 2. Give the "part went silent" case a real signal, not a one-time warning
 
@@ -212,45 +213,69 @@ training curves -- worth revisiting once a longer run is available, e.g. lowerin
 scaling the cross-entropy by `1 / log(num_identities)` so its magnitude stays comparable across
 dataset sizes.
 
-## 4. Widen (or route around) Stage 1's small negative pool
+## 4. Widen (or route around) Stage 1's small negative pool -- IMPLEMENTED 2026-08-28
 
-**The problem**: `InfoNCELoss` deduplicates a PK-sampled batch down to its unique identities
-before building the negative set (needed to avoid treating two photos of the same person as false
-negatives of each other -- see the loss's own docstring). With this repo's current settings
-(`batch_size: 32`, `num_instances: 4` in `configs/stage1_relational_prompts.yaml`), that leaves
-only `32 / 4 = 8` unique identities being classified against each other per training step. Telling
-8 people apart is a much easier task than telling all ~751 training identities apart, so the
-per-step training signal is weaker than the original CLIP-ReID design (which classifies against
-the whole identity table).
+**The original problem**: `InfoNCELoss` (used briefly in Stage 1, since replaced) deduplicated a
+PK-sampled batch down to its unique identities before building its negative set (needed to avoid
+treating two photos of the same person as false negatives of each other). With this repo's batch
+settings (`batch_size: 32`, `num_instances: 4`), that left only `32 / 4 = 8` unique identities
+compared per step, and threw away all but one representative photo per identity in the process.
 
-**Code reference**: `pcr/loss/clip_infonce_loss.py` (`InfoNCELoss.forward`, the `unique_labels,
-inverse = torch.unique(labels, ...)` step); `configs/stage1_relational_prompts.yaml`'s
-`data.batch_size` / `data.num_instances`.
+**First fix (2026-08-28)**: Stage 1 switched back to `SupConLoss` (`pcr/loss/clip_supcon_loss.py`)
+-- it needs no deduplication at all, since its positive mask already tells same-identity rows
+apart from different-identity rows directly. This removed the self-inflicted information loss, but
+the *absolute* comparison size per step was still capped at one PK batch (~32 images, ~8
+identities) -- much smaller than CLIP-ReID's own original design, which classifies against the
+*whole* identity table every step.
 
-**Two options, in order of how much code changes**:
+**Second fix, closing the gap (2026-08-28, per direct user request)**: implemented in
+`examples/train_relational_prompts.py`. Both directions of the loss are now widened to the full
+training set, not just the current batch:
 
-**Option A -- bigger PK batches.** Simplest: raise `batch_size` in the config (e.g. 32 → 64,
-`num_instances` unchanged) to get 16 unique identities per step instead of 8. Costs GPU memory
-proportionally; on an 8GB card this may already be close to the limit alongside HRNet32 + CLIP's
-text tower -- verify before assuming it fits.
+- **i2t** (image anchors against text): compared against **every training identity's** text
+  anchor, not just the ~8 in the current batch. `build_text_snapshot()` rebuilds a
+  `[num_identities, K, D]` text-anchor table once per epoch (under `no_grad`, against that epoch's
+  current `part_ctx`/TAB weights) -- cheap, since it's one extra CLIP-text pass over the identity
+  set per epoch, not per iteration. Each iteration, identities in the current batch get their
+  fresh, differentiable text row spliced back in (gradient must still reach `part_ctx`/TAB for
+  them); every other identity's row comes from the snapshot, detached, as a pure negative.
+- **t2i** (text anchors against images): compared against **every cached training image** (12936,
+  not one batch's ~32) directly -- no snapshot or splicing needed at all here, since
+  `cached_features` never goes stale (the backbone/BPAM are frozen for the entirety of Stage 1).
 
-**Option B -- a persistent memory bank of text anchors** (no batch-size increase needed). Keep a
-FIFO queue of the last `Q` batches' `text_anchors` (the `[C, D]` per-identity representative rows
-already computed in `InfoNCELoss.forward`), and classify each `i2t` step against `text_anchors ∪
-queue` instead of `text_anchors` alone. This is the MoCo/SimCLR "queue" idea, adapted to this
-loss's per-identity-anchor structure rather than raw instance features. It multiplies the
-effective negative count without touching the training batch size or the frozen encoders' memory
-footprint (the queue only stores small `[D]`-sized text-anchor vectors, detached).
+No new memory-bank/queue infrastructure needed, and no new hyperparameter to tune (the "pool size"
+is just `num_identities`/`num_images`, both already known) -- Options A/B below were the originally
+sketched alternatives, superseded by this more direct approach once it became clear Stage 1's own
+frozen encoder makes a full-dataset comparison this cheap.
 
-A complementary, code-light alternative to both: switch the loss formulation itself to **Decoupled
-Contrastive Learning** (Yeh et al., "Decoupled Contrastive Learning," arXiv:2110.06848), which
-removes the positive pair's own term from the denominator of the InfoNCE softmax. Its whole
-motivation is that standard InfoNCE's gradient signal degrades specifically when the negative
-count (or batch size) is small -- exactly this repo's situation -- and DCL was shown to recover
-much of the lost signal without needing bigger batches at all. This would be a targeted change
-inside `InfoNCELoss.forward`'s existing softmax computation, not a new component.
+**Verified**: isolated checks (`build_text_snapshot`'s output shape/finiteness; the batch/snapshot
+splicing produces no overlapping identities between "fresh" and "snapshot" rows) and a real 2-epoch
+Stage 1 smoke run -- no NaN/Inf/errors, per-epoch wall time unchanged (~23s, same as before
+widening) confirming the added cost is negligible, loss decreasing visibly within the first epoch
+against the now much harder (751-way / 12936-way) task. `cache_text_anchors.py` run against the
+result, producing a fully finite `text_prototypes.pth` -- the Stage 2 handoff is unaffected.
 
-## 5. Make VAB/TAB's attention visibility-aware
+**Superseded alternatives, kept for reference**:
+
+*Option A -- bigger PK batches.* Simplest, but limited: raising `batch_size` to 64 only reaches 16
+identities per step, nowhere near 751 -- not pursued once the snapshot approach made the full
+identity set reachable directly.
+
+*Option B -- a MoCo/SimCLR-style FIFO queue of past batches' features.* Would have introduced
+staleness (queued features drift out of date as the producing weights keep training) and a new
+`queue_size` hyperparameter to tune. Not needed here specifically because Stage 1's visual side
+never goes stale at all (frozen encoder) and the text side is cheap enough to fully refresh once
+per epoch -- a queue is the right tool when neither of those is true, which is why it's still worth
+knowing about for e.g. a hypothetical future Stage 1 with an unfrozen encoder.
+
+A code-light alternative for the *loss formulation itself*, if a plain contrastive loss (rather than
+SupCon's multi-positive one) is ever wanted again: **Decoupled Contrastive Learning** (Yeh et al.,
+"Decoupled Contrastive Learning," arXiv:2110.06848), which removes the positive pair's own term
+from the denominator of the InfoNCE softmax specifically to recover signal lost to small
+batches/negative counts -- worth knowing about, though it doesn't apply to `SupConLoss`'s current
+mask-based formulation directly.
+
+## 5. Make VAB/TAB's attention visibility-aware -- IMPLEMENTED 2026-08-28
 
 **The problem**: `VisualAttentionBlock` and `TextualAttentionBlock` mix all K body-part tokens via
 full, unconditional self-attention. A part that's actually occluded still participates as a full
@@ -322,6 +347,34 @@ Where to Focus: Learning Visibility-aware Part-level Features for Partial Person
 CVPR 2019, arXiv:1904.00537) is the earliest and simplest version of the same idea (only compare
 regions visible in both images at matching time) and is worth reading first if the later two feel
 too complex to port directly.
+
+**Status**: implemented in `pcr/models/relation_blocks.py` (`_visibility_attn_bias`, shared by both
+blocks) essentially as sketched above, with one difference for `TextualAttentionBlock`: since
+`PromptLearner.part_ctx` has no per-image signal at all, it uses each identity's *mean* visibility
+across every cached training image of that identity instead of a per-image score (computed once by
+`examples/train_relational_prompts.py::compute_identity_visibility`, saved as
+`identity_visibility.pth` alongside `prompt_learner.pth`/`vab.pth`, and reused unchanged -- not
+recomputed -- by `examples/cache_text_anchors.py`, so the final frozen prototypes match what
+training actually converged against). `VisualAttentionBlock` uses each call's own real per-image
+`vis[:, 1:]` in both Stage 1 and Stage 2, exactly as sketched.
+
+Verified with: (1) isolated forward/backward checks on both blocks (shape correctness, the
+zero-gate no-op property still holding for VAB, masking measurably changing output vs. a uniform-
+visibility control, finite output even at the zero-visibility edge case); (2) a real end-to-end
+smoke run of the full chain -- Stage 1 (375 iterations) -> `cache_text_anchors.py` ->
+Stage 2 (375 iterations) -- all clean, no NaN/Inf/errors.
+
+**A real bug found and fixed along the way, unrelated to the masking formula itself**: the first
+end-to-end run produced `NaN` in every part-branch text prototype. Traced to PyTorch's
+`nn.TransformerEncoderLayer` silently switching to a fused native kernel
+(`torch._transformer_encoder_layer_fwd`) whenever a layer is in `.eval()` mode (which
+`cache_text_anchors.py` puts `PromptLearner`/TAB into, correctly, for deterministic output) --
+that fused kernel produced `NaN` specifically when given a real, non-uniform additive attention
+bias, while the identical computation in `.train()` mode, and `.eval()` mode with a uniform (no-op)
+bias, both came out finite -- isolating the bug to the fused kernel, not the masking math. Fixed
+with `torch.backends.mha.set_fastpath_enabled(False)`, set once at module import in
+`pcr/models/relation_blocks.py` (the only place in this repo building an `nn.TransformerEncoder`,
+so nothing else is affected).
 
 ## 6. Encourage the K parts to actually specialize (longer-term, after 1-5)
 

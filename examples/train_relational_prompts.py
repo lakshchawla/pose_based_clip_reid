@@ -117,6 +117,7 @@ from datetime import timedelta
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from pcr import datasets
@@ -215,7 +216,12 @@ def build_text_snapshot(prompt_learner, text_encoder, num_identities, num_parts,
             prompts = prompt_learner.build_part_prompts(ids, part_vis)
             for k in range(num_parts):
                 text_feat = text_encoder(prompts[1 + k], prompt_learner.tokenized_prompts).float()
-                snapshot[ids, k] = text_feat
+                # L2-normalized before storing -- see this file's own module docstring (the
+                # "SupCon" mapping-table entry) for why: SupConLoss's dot product only behaves as
+                # a real cosine similarity, matching its temperature's calibration, if both sides
+                # are unit-norm -- part_visual (the image side) already is; this was the one place
+                # text wasn't.
+                snapshot[ids, k] = F.normalize(text_feat, p=2, dim=-1)
     return snapshot
 
 
@@ -395,7 +401,11 @@ def main_worker(cfg, setup_only=False):
             # (see that file's docstring).
             loss = b_features.new_zeros(())
             for k in range(num_parts):
-                part_text = text_encoder(prompts[1 + k], prompt_learner.tokenized_prompts).float()
+                # L2-normalized -- see build_text_snapshot's own comment on why: visual_k (below)
+                # is already unit-norm, and SupConLoss's dot product only behaves as a real cosine
+                # similarity, matching its own temperature, if both sides are.
+                part_text = F.normalize(
+                    text_encoder(prompts[1 + k], prompt_learner.tokenized_prompts).float(), p=2, dim=-1)
                 visual_k = part_visual[:, k, :]
                 w_k = b_vis[:, 1 + k]  # same 1+k branch offset as prompts[1+k]/part_visual[:,k,:]
 

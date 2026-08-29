@@ -40,19 +40,33 @@ the detach makes that a guarantee of this class, not an accident of the caller, 
 CosineAlignLoss.) Weights are additionally floored (`weight_floor`, default 1e-3) so no anchor is
 ever exactly zero-weighted.
 
-Temperature default restored to `1.0` (CLIP-ReID's own original value for this exact loss) --
-`InfoNCELoss` used `0.07` instead specifically because CLIP's `0.07` was tuned for a plain
-single-positive contrastive loss, not this multi-positive one (see InfoNCELoss's own now-removed
-docstring, or progress.md's entry on that swap); restoring SupCon without also restoring its
-matching temperature would silently run a multi-positive loss at a single-positive loss's much
-sharper (smaller) temperature, likely destabilizing training rather than helping it.
+Temperature default `0.1` (changed from `1.0` on 2026-08-29 -- see progress.md's entry on this
+change): `1.0` was CLIP-ReID's own original value, tuned for comparing against the handful of
+identities in one small batch. examples/train_relational_prompts.py later widened this loss's own
+comparison pool to the *entire* training set (751 identities / 12936 images per step -- see
+build_text_snapshot's own docstring), and a softmax over that many classes needs a sharper
+temperature to produce a useful gradient at all -- confirmed directly: a real training run at
+`1.0` sat within a few points of the theoretical random-guess floor (`ln(num_identities) * 5 +
+ln(num_images) * 5`) for roughly two full epochs before making visible progress; the same run at
+`0.1` cleared that floor markedly faster and further, using identical data and iteration count.
+
+`anchor_features`/`other_features` are both expected to already be L2-normalized by the caller
+(not enforced inside this class, matching pcr/loss/clip_cosine_align_loss.py's own convention of
+normalizing at the call site) -- otherwise `logits = anchor_features @ other_features.t()` is not
+a real cosine similarity, and `temperature` no longer means what it's calibrated to mean. Found
+directly: this repo's own visual features were always unit-norm (VisualAttentionBlock's own
+output, and BPBreIDEncoder's raw embeddings, are both L2-normalized already), but the text side
+(ClipTextEncoder's raw output) was not -- real measured norms were ~10-13 and varied noticeably
+identity to identity, silently making the effective per-identity temperature inconsistent. Both
+call sites in examples/train_relational_prompts.py now normalize the text side explicitly before
+calling this class.
 """
 import torch
 import torch.nn as nn
 
 
 class SupConLoss(nn.Module):
-    def __init__(self, temperature=1.0, weight_floor=1e-3):
+    def __init__(self, temperature=0.1, weight_floor=1e-3):
         super(SupConLoss, self).__init__()
         self.temperature = temperature
         self.weight_floor = weight_floor

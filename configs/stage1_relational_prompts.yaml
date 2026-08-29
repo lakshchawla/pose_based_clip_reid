@@ -58,10 +58,12 @@ optim:
   lr_min: 0.000001
 
 loss:
-  # 1.0 -- SupConLoss's (and CLIP-ReID's) own original value for this multi-positive loss, not
-  # CLIP's 0.07 (that value is tuned for a plain single-positive contrastive loss -- see
-  # pcr/loss/clip_supcon_loss.py's own docstring for why using the wrong one here would matter).
-  temperature: 1.0
+  # 0.1, not SupConLoss's own original 1.0 (CLIP-ReID's value, tuned for comparing against one
+  # small batch's worth of identities) -- this loss now compares against the full training set
+  # (751 identities / 12936 images) every step, and needs a sharper temperature to give a useful
+  # gradient at that scale. See pcr/loss/clip_supcon_loss.py's own docstring for the real training
+  # measurement this value is based on.
+  temperature: 0.1
 
 logging:
   logs_dir: examples/logs/stage1_prompts

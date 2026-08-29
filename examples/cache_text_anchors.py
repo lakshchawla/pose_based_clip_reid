@@ -20,6 +20,7 @@ import argparse
 import os.path as osp
 
 import torch
+import torch.nn.functional as F
 
 from pcr import datasets
 from pcr.models.clip_text_encoder import ClipTextEncoder
@@ -49,7 +50,14 @@ def compute_text_prototypes(prompt_learner, text_encoder, num_identities, num_br
             prompts = prompt_learner.build_part_prompts(ids, part_vis)  # list of num_branches tensors
             for branch, prompt in enumerate(prompts):
                 text_feat = text_encoder(prompt, prompt_learner.tokenized_prompts)
-                text_prototypes[ids, branch] = text_feat.float()
+                # L2-normalized -- matches examples/train_relational_prompts.py's own text-side
+                # normalization (see that file's build_text_snapshot / pcr/loss/clip_supcon_loss.py's
+                # docstring for why): CosineAlignLoss's own visual-side input is already
+                # normalized (examples/train_relational_finetune.py's compute_losses), so leaving
+                # this table unnormalized would make that loss's dot product not a real cosine
+                # similarity, silently softening its align_temperature far below its intended
+                # (CLIP-standard) value.
+                text_prototypes[ids, branch] = F.normalize(text_feat.float(), p=2, dim=-1)
     return text_prototypes
 
 

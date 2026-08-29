@@ -2494,3 +2494,59 @@ exact same single 10x decay the old `StepLR` gave, just with warmup added in fro
    confirmed exactly 0.0 (frozen) on every branch.
 
 Full repo `python -m py_compile` sweep clean.
+
+---
+
+### 2026-08-29 — Stage 1 SupCon: lowered temperature (1.0 -> 0.1) and L2-normalized the text side;
+### same normalization fix carried into Stage 2's CosineAlignLoss text prototypes
+
+User reported Stage 1's loss "doesn't seem to converge" at `batch_size=64` and asked for a recheck.
+Root-caused with real, instrumented training runs (not just theory): the loss was sitting within a
+few points of its own theoretical random-guess floor (`ln(num_identities)*5 + ln(num_images)*5 ≈
+66.3`) for roughly two full epochs before making visible progress. Two contributing issues found:
+
+**1. Temperature miscalibrated for the widened negative pool.** `SupConLoss`'s `temperature=1.0`
+is CLIP-ReID's own original value, tuned for comparing against one small PK batch's worth of
+identities. The 2026-08-28 "widen the negative pool" change (see that entry) made this loss compare
+against the *entire* training set (751 identities / 12936 images) every step instead -- a
+softmax over that many classes needs a sharper temperature to produce a useful gradient at all.
+Confirmed directly: an instrumented run at `temperature=1.0` sat at 64-68 (near the 66.3 floor)
+through ~180 iterations; the identical run at `temperature=0.1` reached 57.5 in the same iteration
+count, clearing the floor markedly faster and further.
+
+**2. Text embeddings were never L2-normalized, unlike the visual side.** `ClipTextEncoder`'s raw
+output was fed straight into `SupConLoss`'s dot product with no normalization, while the visual
+side (`VisualAttentionBlock`'s output) always was. Measured directly: real text embeddings had
+norm ~10-13, varying by identity -- meaning `logits = anchor @ other.t() / temperature` was never
+a true cosine similarity, and the effective per-identity temperature was inconsistent by whatever
+that identity's arbitrary embedding norm happened to be. The same exact asymmetry existed in Stage
+2's `CosineAlignLoss`: its visual side was normalized (from the BNNeck fix, 2026-08-28), but the
+text-prototype side (built by `cache_text_anchors.py`) was not -- meaning `align_temperature: 0.07`
+(CLIP's own real, standard value, chosen for genuine cosine similarities) had been running roughly
+10-13x softer than intended the whole time.
+
+**Changes**:
+- `configs/stage1_relational_prompts.yaml`: `loss.temperature` `1.0` -> `0.1`.
+- `pcr/loss/clip_supcon_loss.py`: default `temperature` `1.0` -> `0.1`; docstring rewritten to
+  document the real measurement behind both changes and the now-explicit expectation that callers
+  normalize both `anchor_features`/`other_features` before calling.
+- `examples/train_relational_prompts.py`: `part_text` now `F.normalize`'d at both call sites
+  (the live per-iteration encode, and `build_text_snapshot`'s once-per-epoch snapshot, which now
+  stores already-normalized rows so nothing downstream needs to re-normalize it).
+- `examples/cache_text_anchors.py`: `text_prototypes` now `F.normalize`'d before being saved,
+  so Stage 2's frozen table matches the same convention Stage 1 trained against, and
+  `CosineAlignLoss`'s dot product becomes a true cosine similarity there too.
+- `pcr/loss/clip_cosine_align_loss.py`: docstring updated to document the same normalization
+  expectation and the fix.
+
+**Verified** (kept deliberately small/quick, per direct request, since the user is about to start
+a real training run): a real 1-epoch Stage 1 smoke run (batch_size=8, RN50/1024-dim) -- clean, no
+NaN/errors, loss dropped from 80.1 to 58.0 within the single epoch (comfortably below the 66.3
+random floor, and faster than the old temperature=1.0 diagnostic reached even after ~4 epochs'
+worth of iterations); `cache_text_anchors.py` run against the result, and the saved
+`text_prototypes.pth` directly inspected -- every row's norm is now exactly 1.0 (to float32
+precision); a real 1-epoch Stage 2 smoke run against that table -- clean throughout including the
+full eval pass, `align` loss sitting at ~33 (matching `ln(751)*5`, the expected floor for this
+short a run, not a red flag).
+
+Full repo `python -m py_compile` sweep clean.

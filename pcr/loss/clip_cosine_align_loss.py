@@ -16,6 +16,15 @@ gradient descent has a standing incentive to lower a hard-to-align part's own vi
 instead of actually improving its alignment -- a shortcut that reduces this loss without the
 network doing the work the loss is meant to encourage. Weights are additionally floored
 (`weight_floor`, default 1e-3) so no sample is ever exactly zero-weighted.
+
+Both `visual_features` and `text_anchors_table` are expected to already be L2-normalized by the
+caller (not enforced here, same convention as SupConLoss) -- otherwise the dot product below isn't
+a real cosine similarity and `temperature` doesn't mean what it's calibrated to mean. Fixed
+2026-08-29: `visual_features` was already normalized at its call site
+(examples/train_relational_finetune.py), but `text_anchors_table` (built by
+examples/cache_text_anchors.py) wasn't -- real measured text-embedding norms run ~10-13, so this
+loss's dot product was silently running at roughly 10-13x its intended (softer) temperature the
+entire time. `cache_text_anchors.py` now normalizes before saving the table, closing the gap.
 """
 import torch.nn.functional as F
 import torch.nn as nn

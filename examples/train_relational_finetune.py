@@ -102,6 +102,7 @@ argparse-only).
 """
 from __future__ import print_function, absolute_import
 import argparse
+import math
 import os.path as osp
 import random
 import sys
@@ -117,8 +118,9 @@ from pcr import datasets
 from pcr.models.bpbreid_encoder import BPBReIDEncoder, BPBReIDModelCfg
 from pcr.models.bn_neck import PartBNNecks
 from pcr.models.id_classifier import PartIdClassifiers
-from pcr.models.relation_blocks import VisualAttentionBlock
-from pcr.loss import PartTripletLoss, CrossEntropyLabelSmooth, CosineAlignLoss, BodyPartAttentionLoss
+from pcr.models.relation_blocks import VisualAttentionBlock, CrossAttentionBlock
+from pcr.loss import (PartTripletLoss, CrossEntropyLabelSmooth, CosineAlignLoss, BodyPartAttentionLoss,
+                       cross_attention_alignment_loss)
 from pcr.evaluators import Evaluator
 from pcr.utils.config import load_yaml_config
 from pcr.utils.data import IterLoader
@@ -202,6 +204,27 @@ def build_encoder(cfg):
     return encoder
 
 
+def bpa_weight_schedule(epoch, initial, floor, decay_epochs):
+    """Cosine decay from `initial` at epoch 0 down to `floor`, reached at `decay_epochs` and held
+    afterward."""
+    if epoch >= decay_epochs:
+        return floor
+    progress = epoch / decay_epochs
+    return floor + 0.5 * (initial - floor) * (1 + math.cos(math.pi * progress))
+
+
+def crossalign_schedule(epoch, total_epochs, cab_cfg):
+    """0 during warmup, then a linear ramp up to crossalign_lambda_max, then flat."""
+    warmup_end = cab_cfg.crossalign_warmup_fraction * total_epochs
+    ramp_end = warmup_end + cab_cfg.crossalign_ramp_fraction * total_epochs
+    if epoch < warmup_end:
+        return 0.0
+    if epoch >= ramp_end:
+        return cab_cfg.crossalign_lambda_max
+    progress = (epoch - warmup_end) / (ramp_end - warmup_end)
+    return cab_cfg.crossalign_lambda_max * progress
+
+
 def mask_to_pixel_targets(mask, pixels_cls_scores):
     """mask: [B, 1+parts_num, H, W] (soft, sums to 1 per pixel). Resized to pixels_cls_scores'
     spatial size and argmax'd into an integer target per pixel -- matches bpbreid's own
@@ -210,8 +233,9 @@ def mask_to_pixel_targets(mask, pixels_cls_scores):
     return mask.argmax(dim=1)
 
 
-def compute_losses(encoder, vab, bn_necks, id_classifiers, triplet_loss, id_loss, align_loss, bpa_loss,
-                    text_prototypes, imgs, mask, targets, cfg):
+def compute_losses(encoder, vab, cab_i2t, bn_necks, id_classifiers, triplet_loss, id_loss,
+                    align_loss, bpa_loss, text_prototypes, text_self_attention, imgs, mask, targets,
+                    cfg, epoch):
     use_masks = bpa_loss is not None
     if use_masks:
         f_out, vis, pixels_cls_scores = encoder.forward_full(imgs)
@@ -228,6 +252,13 @@ def compute_losses(encoder, vab, bn_necks, id_classifiers, triplet_loss, id_loss
     relation_parts = vab(f_out[:, 1:, :], vis[:, 1:])  # [B, K, D]
     combined = torch.cat([f_out[:, 0:1, :], relation_parts], dim=1)  # [B, 1+K, D]
     num_branches = combined.size(1)
+
+    # CrossAttentionBlock (CAB): grounds the visual branches against this identity's own frozen
+    # text prototypes (see METHODOLOGY.md's Stage 2 / CAB section). `prompt_feats` needs no live
+    # CLIP forward pass -- text_prototypes is already the exact per-branch table Stage 1 produced,
+    # indexed by this batch's real identity labels.
+    prompt_feats = text_prototypes[targets]  # [B, 1+K, D]
+    vis_grounded, A_cross_i2t = cab_i2t(combined, prompt_feats)
 
     # vis shares combined's exact branch axis (0=foreground, 1..K=parts) -- both are built from
     # the same encoder call. Loose hard exclusion for triplet's batch-hard mining only (soft
@@ -283,13 +314,25 @@ def compute_losses(encoder, vab, bn_necks, id_classifiers, triplet_loss, id_loss
                                                              # negatives this loss classifies against
         w = vis[:, branch]  # continuous weighting, not the boolean vis_mask used for triplet
         # BNNeck again: align_loss reads the post-BN feature too (triplet, above, still reads
-        # combined directly). Re-normalized after BN -- BatchNorm1d's own per-dimension scaling
-        # doesn't preserve the unit-norm assumption CosineAlignLoss's fixed-temperature softmax
-        # depends on, so this restores it (see bn_neck.py's own docstring).
-        bn_part = F.normalize(bn_necks(combined, branch), p=2, dim=-1)
+        # combined directly). Reads vis_grounded (CAB's output), not combined -- CAB is what
+        # grounds this branch against text before align_loss compares it to the prototype table.
+        # Re-normalized after BN -- BatchNorm1d's own per-dimension scaling doesn't preserve the
+        # unit-norm assumption CosineAlignLoss's fixed-temperature softmax depends on, so this
+        # restores it (see bn_neck.py's own docstring).
+        bn_part = F.normalize(bn_necks(vis_grounded, branch), p=2, dim=-1)
         align_total = align_total + align_loss(bn_part, branch_prototypes, targets, weights=w)
     total = total + cfg.loss.align_weight * align_total
     log['align'] = align_total.item()
+
+    # L_crossalign: CAB's own image-queries-text attention pattern should look like CLIP's real
+    # internal text self-attention for this identity -- a regularizer keeping CAB's grounding
+    # meaningful rather than an arbitrary learned reweighting. Ramped in on a schedule (see
+    # crossalign_schedule) since CAB starts as an identity function (gate=0) and benefits from a
+    # few epochs of plain L_align pressure first.
+    lambda_crossalign = crossalign_schedule(epoch, cfg.optim.epochs, cfg.cab)
+    l_crossalign = cross_attention_alignment_loss(A_cross_i2t, text_self_attention[targets])
+    total = total + lambda_crossalign * l_crossalign
+    log['crossalign'] = l_crossalign.item()
 
     # Algorithm 2 steps 9/16: L_attn, mandatory whenever masks are configured (see
     # configs/stage2_relational_finetune.yaml's own comment on why this defaults on now, and why
@@ -297,8 +340,11 @@ def compute_losses(encoder, vab, bn_necks, id_classifiers, triplet_loss, id_loss
     if use_masks:
         mask_targets = mask_to_pixel_targets(mask.cuda(), pixels_cls_scores)
         l_bpa, _ = bpa_loss(pixels_cls_scores, mask_targets)
-        total = total + cfg.loss.bpa_weight * l_bpa
+        bpa_weight = bpa_weight_schedule(epoch, cfg.loss.bpa_weight_initial, cfg.loss.bpa_weight_floor,
+                                          cfg.loss.bpa_weight_decay_epochs)
+        total = total + bpa_weight * l_bpa
         log['bpa'] = l_bpa.item()
+        log['bpa_weight'] = bpa_weight
 
     return total, log
 
@@ -341,6 +387,9 @@ def main_worker(cfg, setup_only=False):
         .format(proto['num_branches'], cfg.model.parts_num, num_branches))
     text_prototypes = proto['text_prototypes'].cuda()  # [num_identities, num_branches, D]
 
+    attn_path = osp.join(cfg.stage1.prompt_dir, 'text_self_attention.pth')
+    text_self_attention = load_checkpoint(attn_path)['text_self_attention'].cuda()  # [num_identities, num_branches, num_branches]
+
     encoder = build_encoder(cfg)
     id_classifiers = PartIdClassifiers(num_identities, cfg.model.dim_reduce_output, branches=(0,)).cuda()
     bn_necks = PartBNNecks(num_branches, cfg.model.dim_reduce_output).cuda()
@@ -350,6 +399,8 @@ def main_worker(cfg, setup_only=False):
     vab_path = osp.join(cfg.stage1.prompt_dir, 'vab.pth')
     vab.load_state_dict(load_checkpoint(vab_path))
     print('==> Loaded Stage 1 VisualAttentionBlock weights from {}'.format(vab_path))
+
+    cab_i2t = CrossAttentionBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.cab.num_heads).cuda()
 
     triplet_loss = PartTripletLoss(margin=cfg.loss.triplet_margin).cuda()
     id_loss = CrossEntropyLabelSmooth(num_identities).cuda()
@@ -371,7 +422,7 @@ def main_worker(cfg, setup_only=False):
         return
 
     params = (list(encoder.parameters()) + list(id_classifiers.parameters()) + list(vab.parameters())
-              + list(bn_necks.parameters()))
+              + list(bn_necks.parameters()) + list(cab_i2t.parameters()))
     optimizer = torch.optim.Adam(params, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
     # BoT's own recommended schedule (Luo et al., CVPRW 2019) -- linear warmup for
     # cfg.optim.warmup_epochs (default 10), starting from cfg.optim.warmup_factor x the base LR,
@@ -388,6 +439,7 @@ def main_worker(cfg, setup_only=False):
         encoder.train()
         vab.train()
         bn_necks.train()
+        cab_i2t.train()
         train_loader.new_epoch()
         train_iters = len(train_loader)
 
@@ -403,14 +455,16 @@ def main_worker(cfg, setup_only=False):
             targets = targets.cuda()
 
             optimizer.zero_grad()
-            loss, log = compute_losses(encoder, vab, bn_necks, id_classifiers, triplet_loss, id_loss,
-                                        align_loss, bpa_loss, text_prototypes, imgs, mask, targets, cfg)
+            loss, log = compute_losses(encoder, vab, cab_i2t, bn_necks, id_classifiers, triplet_loss,
+                                        id_loss, align_loss, bpa_loss, text_prototypes,
+                                        text_self_attention, imgs, mask, targets, cfg, epoch)
             loss.backward()
             optimizer.step()
 
             if (it + 1) % cfg.logging.print_freq == 0:
-                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\tVAB gate {:.3f}\t{}'.format(
+                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\tVAB gate {:.3f}\tCAB gate {:.3f}\t{}'.format(
                     epoch, it + 1, train_iters, loss.item(), torch.tanh(vab.gate).item(),
+                    torch.tanh(cab_i2t.gate).item(),
                     '\t'.join('{} {:.3f}'.format(k, v) for k, v in log.items())))
 
         lr_scheduler.step()
@@ -437,6 +491,7 @@ def main_worker(cfg, setup_only=False):
                 'state_dict': encoder.model.state_dict(),
                 'vab_state_dict': vab.state_dict(),
                 'bn_necks_state_dict': bn_necks.state_dict(),
+                'cab_i2t_state_dict': cab_i2t.state_dict(),
                 'epoch': epoch + 1,
                 'best_mAP': best_mAP,
                 'optimizer': optimizer.state_dict(),

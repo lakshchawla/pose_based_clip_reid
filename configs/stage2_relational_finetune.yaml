@@ -33,6 +33,16 @@ vab:
   num_heads: 4                 # must match stage1's vab.num_heads/num_layers -- these define the
   num_layers: 1                # architecture vab.pth's weights were trained for
 
+cab:
+  # CrossAttentionBlock: grounds each visual branch against its frozen text prototype before
+  # L_align reads it (see METHODOLOGY.md's Stage 2 / CAB section). L_crossalign ramps in on a
+  # schedule (0 during warmup, linear ramp, then flat) rather than from epoch 0, since CAB starts
+  # as an identity function (gate=0) and needs a few epochs of plain L_align pressure first.
+  num_heads: 4
+  crossalign_warmup_fraction: 0.25
+  crossalign_ramp_fraction: 0.15
+  crossalign_lambda_max: 0.3
+
 data:
   dataset: market1501         # or dukemtmc-reid
   data_dir: ../datasets
@@ -78,7 +88,14 @@ loss:
   # 1's SupConLoss (multi-positive, uses 1.0 instead -- see that file's own docstring for why the
   # two losses' shapes call for different temperatures).
   align_temperature: 0.07
-  bpa_weight: 0.35                   # only used when data.masks_dir is set; bpbreid's own yaml default
+  # bpa_weight now cosine-decays from bpa_weight_initial to bpa_weight_floor over
+  # bpa_weight_decay_epochs, instead of a flat weight -- keeps L_attn from ever going fully
+  # slack as BPAM keeps changing through Stage 2, so its part definitions can't drift arbitrarily
+  # far from Stage 0/1's anatomical convention (which text_prototypes.pth is frozen against). See
+  # METHODOLOGY.md's Stage 2 section. Only used when data.masks_dir is set.
+  bpa_weight_initial: 1.0
+  bpa_weight_floor: 0.15
+  bpa_weight_decay_epochs: 20
 
 optim:
   lr: 0.00035

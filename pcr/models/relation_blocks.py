@@ -147,3 +147,33 @@ class TextualAttentionBlock(nn.Module):
         token_visibility = part_visibility.repeat_interleave(self.n_ctx, dim=1)  # [B, K*n_ctx]
         attn_bias = _visibility_attn_bias(token_visibility, self.num_heads)
         return self.encoder(ctx_tokens, mask=attn_bias)
+
+
+class CrossAttentionBlock(nn.Module):
+    """Multi-head cross-attention: `query_tokens` attends to `context_tokens` from the other
+    modality. Tanh-gated, zero-init residual (starts as an identity function). See
+    METHODOLOGY.md's Stage 2 / CAB section for how this is used."""
+
+    def __init__(self, dim, num_heads=4):
+        super(CrossAttentionBlock, self).__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, query_tokens, context_tokens):
+        """query_tokens/context_tokens: [B, N, D]. Returns (updated_query [B, N, D], attn_weights
+        [B, N, N] averaged over heads)."""
+        B, N, D = query_tokens.shape
+        q = self.q_proj(query_tokens).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(context_tokens).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(context_tokens).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        attn = torch.softmax(q @ k.transpose(-1, -2) / (self.head_dim ** 0.5), dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, D)
+        out = self.out_proj(out)
+        updated_query = query_tokens + torch.tanh(self.gate) * out
+        return updated_query, attn.mean(dim=1)

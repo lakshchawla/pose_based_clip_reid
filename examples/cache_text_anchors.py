@@ -61,6 +61,24 @@ def compute_text_prototypes(prompt_learner, text_encoder, num_identities, num_br
     return text_prototypes
 
 
+def compute_text_self_attention(text_encoder, text_prototypes, id_batch):
+    """text_prototypes: [num_identities, num_branches, D] (already built above). Returns
+    [num_identities, num_branches, num_branches]: each identity's own CLIP text-side self-attention
+    among its branch embeddings -- CrossAttentionBlock's L_crossalign target in Stage 2 (see
+    pcr/loss/cross_attn_align_loss.py). Precomputed here, once, for the same reason
+    text_prototypes is: prompt_learner/TAB/the text encoder are frozen after Stage 1, so this is a
+    deterministic function of identity alone."""
+    num_identities, num_branches, _ = text_prototypes.shape
+    attn_table = torch.zeros(num_identities, num_branches, num_branches,
+                              dtype=torch.float32, device='cuda')
+    with torch.no_grad():
+        for start in range(0, num_identities, id_batch):
+            end = min(start + id_batch, num_identities)
+            attn_table[start:end] = text_encoder.encode_branch_self_attention(
+                text_prototypes[start:end]).float()
+    return attn_table
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build Stage 2's frozen text-prototype table from a trained Stage-1 checkpoint")
@@ -97,6 +115,14 @@ def main():
     torch.save({'text_prototypes': text_prototypes.cpu(), 'num_identities': num_identities,
                 'num_branches': num_branches}, out_path)
     print('==> Saved {}'.format(out_path))
+
+    print('==> Building text self-attention table for CrossAttentionBlock (Stage 2)')
+    text_self_attention = compute_text_self_attention(text_encoder, text_prototypes,
+                                                        cfg.data.cache_batch_size)
+    attn_path = osp.join(cfg.logging.logs_dir, 'text_self_attention.pth')
+    torch.save({'text_self_attention': text_self_attention.cpu(), 'num_identities': num_identities,
+                'num_branches': num_branches}, attn_path)
+    print('==> Saved {}'.format(attn_path))
 
 
 if __name__ == '__main__':

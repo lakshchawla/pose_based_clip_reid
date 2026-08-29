@@ -71,3 +71,19 @@ class ClipTextEncoder(nn.Module):
         x = self.ln_final(x).type(self.dtype)
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
+
+    def encode_branch_self_attention(self, branch_embeddings):
+        """branch_embeddings: [B, L, D] -- e.g. one identity's L=1+K per-branch pooled prompt
+        embeddings (not a CLIP-template token sequence). Runs the last transformer block's own
+        attention with need_weights=True (third_party/clip hardcodes it False) to get a real
+        [B, L, L] self-attention matrix over these L tokens, with no attention mask -- used only
+        offline, no_grad (see examples/cache_text_anchors.py)."""
+        assert self.embed_dim == self.transformer_width, (
+            "encode_branch_self_attention reuses the text transformer's own last block, which "
+            "operates at transformer_width ({}) -- only valid when embed_dim ({}) matches, as it "
+            "does for ViT-B/16 and ViT-B/32 but not RN50/RN101/RN50x4/RN50x16/RN50x64 (see this "
+            "class's own docstring).".format(self.transformer_width, self.embed_dim))
+        resblock = self.transformer.resblocks[-1]
+        x = resblock.ln_1(branch_embeddings.permute(1, 0, 2).type(self.dtype))  # NLD -> LND
+        _, attn = resblock.attn(x, x, x, need_weights=True, average_attn_weights=True)
+        return attn  # [B, L, L]

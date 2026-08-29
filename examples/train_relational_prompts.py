@@ -1,112 +1,3 @@
-"""Stage 1: per-part CLIP prompt learning, with relational mixing across a person's K part
-tokens on both sides -- TextualAttentionBlock (owned by PromptLearner) on the text side,
-VisualAttentionBlock on the image side. Implements "Algorithm 1 -- Stage 1: Prompt + Relation
-Learning" exactly (see progress.md's entry on this file for the full step-by-step mapping);
-correspondence to that algorithm's own names:
-
-  Algorithm 1 name          This file / pcr/models
-  -----------------          -----------------------
-  backbone + BPAM            BPBReIDEncoder (frozen, loaded from Stage 0's checkpoint)
-  CLIP image encoder         ClipImageEncoder (frozen, loaded -- NOT consumed by this script's
-                              forward pass; BPBreID's backbone remains the sole visual encoder
-                              actually producing embeddings used in any loss here. Loaded/frozen
-                              only because Algorithm 1's own initialization step says to.)
-  CLIP text encoder          ClipTextEncoder (frozen)
-  ctx_params                 PromptLearner.part_ctx (K parts only -- PromptLearner also owns a
-                              separate fg_ctx for a foreground branch that Algorithm 1 does not
-                              use at all; this script trains part_ctx only, see below)
-  VRB                        VisualAttentionBlock (pcr/models/relation_blocks.py)
-  TRB                        TextualAttentionBlock (owned by PromptLearner, same file)
-  InfoNCE                    SupConLoss (pcr/loss/clip_supcon_loss.py) -- CLIP-ReID's actual,
-                              multi-positive contrastive loss, restored 2026-08-28 after a
-                              round-trip through a literal single-positive `InfoNCELoss` (removed)
-                              that matched Algorithm 1 step 15's own wording more closely, but
-                              fit this file's PK-sampled batches worse: InfoNCE needed a
-                              deduplication patch to avoid treating a person's own other photos in
-                              the batch as false negatives, and that patch meant only one
-                              representative photo per identity ever shaped the text-side
-                              gradient, and the comparison shrank to only the unique identities in
-                              one batch (~8). SupCon needs no such patch -- its positive mask
-                              already recognizes same-identity rows as positives directly, so
-                              every photo in the batch stays a comparison point and contributes to
-                              its identity's gradient, not just one representative. See that
-                              file's own docstring for the full mechanism and why this is the
-                              better fit specifically because this file uses PK sampling on
-                              purpose. Temperature restored to `1.0` (SupCon's own original value)
-                              alongside the loss swap -- `0.07` was tuned for InfoNCE's
-                              single-positive shape, not this one.
-
-                              Widened further, 2026-08-28: the comparison pool on both sides of
-                              SupCon is no longer restricted to the current PK batch. i2t compares
-                              each image against *every* training identity's text anchor (not just
-                              the ~8 in the current batch) via build_text_snapshot's once-per-epoch
-                              full-identity table, spliced with this batch's own fresh/
-                              differentiable rows; t2i compares each text prompt against *every*
-                              cached image in the training set (cached_features never goes stale --
-                              the backbone/BPAM are frozen for all of Stage 1). This is what
-                              matches CLIP-ReID's own original design (full-identity-table
-                              classification), which a single PK batch alone cannot reach no
-                              matter how it's sampled -- see IMPROVEMENT_PLAN.md section 4 and
-                              progress.md's entry on this change.
-
-Deliberately NOT in this script, matching Algorithm 1 exactly (steps 8, 15-16 extract BPAM's
-global/foreground feature f_g but never use it again, and the loss sum is over K parts only, no
-foreground term): no foreground contrastive loss, and PromptLearner.fg_ctx is excluded from this
-script's optimizer entirely -- it stays at its random initialization after Stage 1 runs. This
-leaves it meaningless for Stage 2's own foreground alignment term downstream; that inconsistency
-is a known, flagged consequence of scoping this fix to Stage 1 only, not something this file
-silently works around.
-
-Batches are genuinely PK-sampled from the cached feature set (build_pk_batches, below) --
-Algorithm 1 step 6, and now the very thing SupConLoss's own multi-positive mechanism is built to
-use: every identity's several images in a batch become several positives contributing to the same
-gradient, not merely "extra useful context" the way it was framed under InfoNCE.
-
-The whole training set's part-embeddings are cached once under no_grad before the training loop
-starts (BPBreID/BPAM are frozen throughout, so nothing about them changes step to step) -- PK
-batches are then drawn from indices into that cache, not by re-running the encoder. Unlike an
-earlier version of this file, there is no upstream visibility filter before this cache is built:
-every image in the dataset is cached and trained on, no exceptions (see below for why).
-
-No hard per-branch visibility gating anywhere -- every branch contributes for every cached
-sample, unconditionally. Reliability is instead handled by *weighting*, not exclusion:
-build_encoder (below) switches this stage's own encoder to continuous (not binary) visibility
-scores, and each part's own SupConLoss call is weighted by that part's own per-image visibility
-(cached alongside the features, in cached_visibility) -- a poorly-visible part contributes
-proportionally less to its own loss term instead of the whole image being rejected outright. This
-replaces the upstream image-level filter this file used to run (pcr/utils/visibility_filter.py,
-deleted -- see progress.md's entry on this change): that filter discarded 61% of Market1501's
-training images in practice, was the wrong granularity (an image with 4 good parts and 1 occluded
-one lost all 4), and was found to be driven by an undertrained BPAM signal rather than genuine
-occlusion. VisualAttentionBlock is also now visibility-aware at the attention level itself, not
-just in the loss that consumes its output (see pcr/models/relation_blocks.py's own docstring) --
-each image's own per-part visibility (b_vis, already cached) is passed into vab() as a soft
-attention-score bias, so a poorly-visible part's near-garbage feature contributes less as a KEY to
-every other part's post-attention representation, closing the contamination gap loss-level
-weighting alone could never reach.
-
-TextualAttentionBlock has no per-image signal to use the same way -- PromptLearner.part_ctx is
-indexed only by identity label (build_part_prompts(labels, part_visibility)); it has no per-image
-input at all. compute_identity_visibility (below) substitutes each identity's *mean* per-part
-visibility across every cached image of that identity, computed once here and passed into both
-this script's training loop and (via the saved identity_visibility.pth) examples/
-cache_text_anchors.py's own final prompt-building pass, so TAB's output stays a consistent,
-deterministic function of identity alone in both places. The gradient that reaches part_ctx/TAB
-through SupConLoss's own per-image weighting was already an implicitly visibility-weighted
-aggregate over whichever instances of that identity are in the current PK batch; this adds a
-second, complementary mechanism at the attention level itself, mirroring VAB's.
-
-Produces three files consumed by examples/cache_text_anchors.py (not by Stage 2 directly -- see
-that script's own docstring for why the final text-prototype computation is a separate step):
-prompt_learner.pth (PromptLearner's state, including TextualAttentionBlock and the untrained
-fg_ctx), vab.pth (VisualAttentionBlock's state -- unlike the text-side modules, VAB is *not*
-discarded after Stage 1; Stage 2 loads vab.pth to continue training the same VisualAttentionBlock
-instance), and identity_visibility.pth (the per-identity mean visibility table described above).
-
-Config-driven (YAML), not argparse -- see configs/stage1_relational_prompts.yaml. This is a
-deliberate deviation from the rest of pcr2 (train_uda.py/train_usl.py stay argparse-only, decided
-directly with the user -- see progress.md).
-"""
 from __future__ import print_function, absolute_import
 import argparse
 import os.path as osp
@@ -190,7 +81,7 @@ def build_text_snapshot(prompt_learner, text_encoder, num_identities, num_parts,
     using the model's CURRENT part_ctx/TextualAttentionBlock weights. This is what widens Stage
     1's negative pool from "the ~8 identities in one PK batch" to "every identity in the training
     set", matching CLIP-ReID's own original Stage 1 design (full-identity-table classification,
-    not a batch-restricted one) -- see IMPROVEMENT_PLAN.md section 4 and progress.md's entry on
+    not a batch-restricted one) -- see plans/IMPROVEMENT_PLAN.md section 4 and progress.md's entry on
     this change for the full reasoning.
 
     Only used as a *negative* pool for identities NOT present in the current PK batch (see
@@ -392,7 +283,7 @@ def main_worker(cfg, setup_only=False):
 
             # Identities NOT in this batch -- their text row comes from this epoch's (detached)
             # snapshot instead of a fresh re-encoding, widening i2t's negative pool to the full
-            # training set. See build_text_snapshot's own docstring / IMPROVEMENT_PLAN.md section 4.
+            # training set. See build_text_snapshot's own docstring / plans/IMPROVEMENT_PLAN.md section 4.
             in_batch = torch.zeros(num_identities, dtype=torch.bool, device=b_labels.device)
             in_batch[b_labels] = True
             other_ids = in_batch.logical_not().nonzero(as_tuple=True)[0]

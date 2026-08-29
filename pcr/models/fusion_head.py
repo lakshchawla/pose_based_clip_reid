@@ -1,4 +1,4 @@
-"""Single-descriptor fusion for inference/gallery-indexing (reid_pipeline_plan.md section 4),
+"""Single-descriptor fusion for inference/gallery-indexing (plans/reid_pipeline_plan.md section 4),
 adapted to this repo's actual encoder convention: BPBReIDEncoder.forward returns one [B, M, D]
 tensor (branch 0 = foreground/global, branches 1..K = parts, per-branch L2-normalized already)
 and one [B, M] visibility tensor, not the plan's separate global_feat/part_feats/visibility[K]

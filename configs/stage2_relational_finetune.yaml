@@ -15,12 +15,12 @@
 # triplet only (loss.triplet_visibility_min, below).
 
 model:
-  backbone: resnet50          # must match stage1's model.backbone -- see stage1.prompt_dir note below
+  backbone: hrnet32          # must match stage1's model.backbone -- see stage1.prompt_dir note below
   # Algorithm 2's own initialization step: load the SAME Stage 0 checkpoint Stage 1 used going in
   # (Stage 1 never updates backbone/BPAM, so this is that exact checkpoint, not a separate one) --
   # not ImageNet init, and not Stage 1's own output (Stage 1 produces no encoder checkpoint at all).
   checkpoint_path: 'examples/logs/stage0_bpa/model_best.pth.tar'
-  dim_reduce_output: 1024    # must match stage1's model.dim_reduce_output and clip.arch's text embed dim
+  dim_reduce_output: 512     # must match stage1's model.dim_reduce_output and clip.arch's text embed dim
   parts_num: 5
 
 stage1:

@@ -3,7 +3,7 @@ visual side (VisualAttentionBlock, over BPAM's pooled part features) and the tex
 (TextualAttentionBlock, over PromptLearner's per-part learnable context tokens) -- see
 progress.md's entry on this change for the full design rationale.
 
-Both blocks are now visibility-aware (see changes.md's "Red flag 6" / IMPROVEMENT_PLAN.md section
+Both blocks are now visibility-aware (see changes.md's "Red flag 6" / plans/IMPROVEMENT_PLAN.md section
 5 for the full rationale): every image, including fully-occluded ones, still reaches both blocks
 unfiltered (the upstream image-level filter, pcr/utils/visibility_filter.py, was removed entirely
 -- see progress.md's entry on the visibility-filter-to-weighting refactor), but each block now uses

@@ -1,6 +1,6 @@
 # PCR
 
-PCR combines three techniques into one pipeline, per `reid_pipeline_plan.md`:
+PCR combines three techniques into one pipeline, per `plans/reid_pipeline_plan.md`:
 
 1. **BPBreID** part-attention feature pooling (K learnable body parts + visibility scores, no
    external masks needed at forward time).

@@ -22,7 +22,7 @@ correspondence to that algorithm's own names:
                                via the softmax), restoring CLIP-ReID's own original I2TLoss
                                mechanism rather than the literal per-sample regression Algorithm 2's
                                own wording describes (see changes.md's "Red flag 4" /
-                               IMPROVEMENT_PLAN.md section 3 for why the pure-regression version was
+                               plans/IMPROVEMENT_PLAN.md section 3 for why the pure-regression version was
                                replaced -- it had no term pushing different identities' features
                                apart at all). Parts only (branches 1..K) -- no foreground/global
                                alignment term at all, matching Stage 1's own scope (fg_ctx is never

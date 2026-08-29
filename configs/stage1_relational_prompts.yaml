@@ -12,16 +12,16 @@
 # this); every image is used, weighted per-part inside SupConLoss instead.
 
 model:
-  backbone: resnet50          # or resnet50 -- must match Stage 0's own backbone
+  backbone: hrnet32          # or resnet50 -- must match Stage 0's own backbone
   # Algorithm 1's own initialization step: load Stage 0's converged checkpoint, not ImageNet
   # init -- run examples/train_bpa_segmentation.py first (configs/stage0_bpa_segmentation.yaml)
   # to produce this file.
   checkpoint_path: 'examples/logs/stage0_bpa/model_best.pth.tar'
-  dim_reduce_output: 1024    # must equal clip.arch's text embed dim (1024 for RN50/RN50x64)
+  dim_reduce_output: 512     # must equal clip.arch's text embed dim (512 for ViT-B/32 and ViT-B/16)
   parts_num: 5                # K body parts; num_branches = 1 (foreground) + parts_num
 
 clip:
-  arch: RN50                  # 1024-dim text embedding, matching model.dim_reduce_output above --
+  arch: ViT-B/16               # 512-dim text embedding, matching model.dim_reduce_output above --
                                 # see pcr/models/clip_text_encoder.py's own docstring for other archs' sizes
   n_ctx: 4                    # learnable context tokens per (identity, branch)
 

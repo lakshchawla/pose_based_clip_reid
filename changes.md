@@ -35,7 +35,7 @@ A code-focused review and a research-methodology review were run against Stage 0
 stand today. Below is what they found, explained simply -- what's wrong, why it matters, and what
 to do about it. This section adds to the "Changes to be done" items above; it doesn't replace them
 (those are still valid, just written in more technical language). Concrete code-level fixes with
-math and paper references are in `IMPROVEMENT_PLAN.md`.
+math and paper references are in `plans/IMPROVEMENT_PLAN.md`.
 
 ### 1. ~~(Most serious) The alignment loss can "cheat" by hiding a part instead of improving it~~ -- FIXED 2026-08-28
 
@@ -63,7 +63,7 @@ part-attention head is currently only smoke-tested for 1 epoch instead of the in
 recurs in a real run, nothing in the log would reveal it.
 
 **Fix**: log how often this happens (a per-part "how many batches had zero valid triplets" counter,
-printed periodically) instead of relying on a one-time warning. See `IMPROVEMENT_PLAN.md`
+printed periodically) instead of relying on a one-time warning. See `plans/IMPROVEMENT_PLAN.md`
 section 2.
 
 ### 3. A leftover scratch note sitting inside Stage 0's file
@@ -93,7 +93,7 @@ own signal. Stage 1 switched back to `SupConLoss` (fixing the waste), then was w
 close the remaining gap this item was still flagging: Stage 1 now compares every image against
 *every* training identity's text anchor (751, not ~8) and every text prompt against *every* cached
 training image (12936, not one batch's worth) -- matching CLIP-ReID's own original full-identity-
-table design exactly. See `IMPROVEMENT_PLAN.md` section 4 and `progress.md`'s entry on this change
+table design exactly. See `plans/IMPROVEMENT_PLAN.md` section 4 and `progress.md`'s entry on this change
 for the full mechanism (`examples/train_relational_prompts.py::build_text_snapshot`).
 
 ### 6. ~~Unmasked attention blocks spread bad information into good parts, not just their own loss term~~ -- FIXED 2026-08-28

@@ -1,7 +1,7 @@
 """Thin sequential orchestrator: Stage 0 (optional BPA segmentation pretraining) -> Stage 1
 (prompt learning) -> cache_text_anchors (build Stage 2's frozen alignment target from Stage 1's
 checkpoint) -> Stage 2 (backbone finetune) -> Stage 3 (UDA or USL domain adaptation, user-selected)
--> eval, per reid_pipeline_plan.md section 6. Each stage script already evaluates internally at
+-> eval, per plans/reid_pipeline_plan.md section 6. Each stage script already evaluates internally at
 the end of its own run (via pcr/evaluators.py::Evaluator), so no separate eval step exists here --
 "eval" in the plan's own section 6 is what Stage 3 already does.
 

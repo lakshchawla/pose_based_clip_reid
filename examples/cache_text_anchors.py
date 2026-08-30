@@ -38,7 +38,7 @@ def compute_text_prototypes(prompt_learner, text_encoder, num_identities, num_br
     """identity_visibility: [num_identities, num_branches], the exact table
     examples/train_relational_prompts.py computed and saved -- reused unchanged (not
     recomputed) so TextualAttentionBlock's attention bias here matches training exactly, keeping
-    part_ctx/TAB's output a deterministic function of identity alone (see relation_blocks.py's own
+    ctx/TAB's output a deterministic function of identity alone (see relation_blocks.py's own
     docstring)."""
     prompt_learner.eval()
     text_prototypes = torch.zeros(num_identities, num_branches, text_encoder.embed_dim,
@@ -46,8 +46,8 @@ def compute_text_prototypes(prompt_learner, text_encoder, num_identities, num_br
     with torch.no_grad():
         for start in range(0, num_identities, id_batch):
             ids = torch.arange(start, min(start + id_batch, num_identities), device='cuda')
-            part_vis = identity_visibility[ids, 1:]  # [b, num_parts], same slice as training
-            prompts = prompt_learner.build_part_prompts(ids, part_vis)  # list of num_branches tensors
+            branch_vis = identity_visibility[ids]  # [b, num_branches], same as training
+            prompts, _ = prompt_learner.build_part_prompts(ids, branch_vis)  # list of num_branches tensors
             for branch, prompt in enumerate(prompts):
                 text_feat = text_encoder(prompt, prompt_learner.tokenized_prompts)
                 # L2-normalized -- matches examples/train_relational_prompts.py's own text-side

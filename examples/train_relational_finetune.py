@@ -24,10 +24,9 @@ correspondence to that algorithm's own names:
                                own wording describes (see changes.md's "Red flag 4" /
                                plans/IMPROVEMENT_PLAN.md section 3 for why the pure-regression version was
                                replaced -- it had no term pushing different identities' features
-                               apart at all). Parts only (branches 1..K) -- no foreground/global
-                               alignment term at all, matching Stage 1's own scope (fg_ctx is never
-                               trained there, so a foreground anchor would be meaningless noise; see
-                               changes.md's now-resolved entry on this).
+                               apart at all). All M=1+K branches, global/foreground included --
+                               Stage 1 now trains ctx/TAB on all branches uniformly, so
+                               text_prototypes[:,0,:] is a real anchor, not meaningless noise.
   L_attn                       BodyPartAttentionLoss, mandatory by default now (data.masks_dir
                                defaults to Market1501's real masks, matching Algorithm 2's own
                                unconditional framing) but still optional in code for datasets with
@@ -81,9 +80,9 @@ filter discarded 61% of Market1501's training images in practice, was the wrong 
 image with 4 good parts and 1 occluded one lost all 4), and was found to be driven by an
 undertrained BPAM signal rather than genuine occlusion. VisualAttentionBlock is also now
 visibility-aware at the attention level itself (see pcr/models/relation_blocks.py's own docstring):
-this forward pass's own vis[:, 1:] is passed into vab() as a soft attention-score bias, so a
-poorly-visible part contributes less as a key to every other part's post-attention representation,
-not just less to its own downstream loss term.
+this forward pass's own vis is passed into vab() as a soft attention-score bias, so a
+poorly-visible branch contributes less as a key to every other branch's post-attention
+representation, not just less to its own downstream loss term.
 
 End-of-training checkpoint (Algorithm 2 step 20) bundles VisualAttentionBlock's and PartBNNecks'
 state into the SAME saved dict as the encoder's own state ('vab_state_dict'/'bn_necks_state_dict'
@@ -243,14 +242,12 @@ def compute_losses(encoder, vab, cab_i2t, bn_necks, id_classifiers, triplet_loss
         f_out, vis = encoder(imgs)
         pixels_cls_scores = None
 
-    # VisualAttentionBlock mixes the K part branches only; foreground (branch 0) passes through
-    # untouched, then the two are recombined into one [B, 1+K, D] tensor so the rest of this
-    # function (triplet/align losses) can keep treating "all branches" uniformly, same as before
-    # VAB existed. vis[:, 1:] is this same forward pass's own per-part visibility, passed in as
-    # VAB's attention bias (see relation_blocks.py's own docstring) -- unlike Stage 1, no separate
-    # per-identity table is needed here: VAB always has a real, fresh per-image signal available.
-    relation_parts = vab(f_out[:, 1:, :], vis[:, 1:])  # [B, K, D]
-    combined = torch.cat([f_out[:, 0:1, :], relation_parts], dim=1)  # [B, 1+K, D]
+    # VisualAttentionBlock mixes all M=1+K branches uniformly (global/foreground + K parts -- see
+    # relation_blocks.py's own module docstring). vis is this same forward pass's own per-branch
+    # visibility, passed in as VAB's attention bias -- unlike Stage 1, no separate per-identity
+    # table is needed here: VAB always has a real, fresh per-image signal available. VAB's own
+    # attention pattern (L_relalign's consumer, Stage 1 only) isn't used here.
+    combined, _ = vab(f_out, vis)  # [B, 1+K, D]
     num_branches = combined.size(1)
 
     # CrossAttentionBlock (CAB): grounds the visual branches against this identity's own frozen
@@ -301,15 +298,14 @@ def compute_losses(encoder, vab, cab_i2t, bn_necks, id_classifiers, triplet_loss
     total = total + cfg.loss.triplet_weight * l_tri_parts
     log['tri_parts'] = l_tri_parts.item()
 
-    # Algorithm 2 steps 14-15: L_align, a softmax classification of each part's feature against
+    # Algorithm 2 steps 14-15: L_align, a softmax classification of each branch's feature against
     # that branch's FULL frozen prototype table (every identity is an implicit negative), summed
-    # over the K PART branches only -- no foreground/global alignment term at all, matching Stage
-    # 1's own scope exactly (fg_ctx is never trained there -- see progress.md's entry on that
-    # rewrite -- so text_prototypes[:, 0, :] is meaningless noise; excluding branch 0 here means
-    # that noise is never actually used for anything, resolving changes.md's flagged consequence as
-    # a side effect of matching Algorithm 2's own scope, not a separate workaround).
+    # over all M=1+K branches -- global/foreground included, now that Stage 1 gives it a real
+    # SupCon-trained text prototype too (see relation_blocks.py's own module docstring). This is
+    # also what makes a separate global-branch i2t loss (L_i2tce, considered alongside CAB)
+    # unnecessary: L_align already covers branch 0 here.
     align_total = f_out.new_zeros(())
-    for branch in range(1, num_branches):
+    for branch in range(num_branches):
         branch_prototypes = text_prototypes[:, branch, :]  # [num_identities, D], full table -- the
                                                              # negatives this loss classifies against
         w = vis[:, branch]  # continuous weighting, not the boolean vis_mask used for triplet

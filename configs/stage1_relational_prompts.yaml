@@ -1,10 +1,11 @@
-# Stage 1: per-part CLIP prompt learning, with relational mixing across a person's K part
-# tokens on both sides -- TextualAttentionBlock (owned by PromptLearner) on the text side,
-# VisualAttentionBlock on the image side. BPBreID backbone, the CLIP text encoder, and the CLIP
-# image encoder are all frozen; only part_ctx (incl. TextualAttentionBlock) and
-# VisualAttentionBlock train -- see examples/train_relational_prompts.py's own docstring for the
-# full Algorithm 1 this file's script now follows exactly. Run examples/cache_text_anchors.py
-# against this same config afterward to build Stage 2's frozen text-prototype table.
+# Stage 1: per-branch CLIP prompt learning, with relational mixing across a person's M=1+K
+# branches (global/foreground + K parts, uniformly) on both sides -- TextualAttentionBlock (owned
+# by PromptLearner) on the text side, VisualAttentionBlock on the image side. BPBreID backbone,
+# the CLIP text encoder, and the CLIP image encoder are all frozen; only ctx (incl.
+# TextualAttentionBlock) and VisualAttentionBlock train -- see
+# examples/train_relational_prompts.py's own docstring for the full Algorithm 1 this file's
+# script now follows exactly. Run examples/cache_text_anchors.py against this same config
+# afterward to build Stage 2's frozen text-prototype table.
 #
 # Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the tab:/vab:
 # sections below are the new content relative to that file. No visibility: section -- the
@@ -26,12 +27,20 @@ clip:
   n_ctx: 4                    # learnable context tokens per (identity, branch)
 
 tab:
-  num_heads: 4                 # TextualAttentionBlock's attention heads, over the K part branches
+  num_heads: 4                 # TextualAttentionBlock's attention heads, over all M=1+K branches
   num_layers: 1                # start shallow -- see progress.md for the ablation this should feed
 
 vab:
-  num_heads: 4                 # VisualAttentionBlock's attention heads, over the K part branches
+  num_heads: 4                 # VisualAttentionBlock's attention heads, over all M=1+K branches
   num_layers: 1                # start shallow -- see progress.md for the ablation this should feed
+
+relalign:
+  # L_relalign: pulls VAB's branch-to-branch attention pattern toward TAB's (detached), guarding
+  # against both blocks converging to degenerate near-identical patterns across branches. Same
+  # warmup/ramp/flat schedule shape as Stage 2's crossalign -- see METHODOLOGY.md.
+  warmup_fraction: 0.3
+  ramp_fraction: 0.2
+  lambda_max: 0.3
 
 data:
   dataset: market1501         # or dukemtmc-reid
@@ -58,11 +67,11 @@ optim:
   lr_min: 0.000001
 
 loss:
-  # 0.1, not SupConLoss's own original 1.0 (CLIP-ReID's value, tuned for comparing against one
-  # small batch's worth of identities) -- this loss now compares against the full training set
-  # (751 identities / 12936 images) every step, and needs a sharper temperature to give a useful
-  # gradient at that scale. See pcr/loss/clip_supcon_loss.py's own docstring for the real training
-  # measurement this value is based on.
+  # Initial value only -- SupConLoss's temperature is learnable (see that file's own docstring)
+  # and logged every epoch. 0.1, not SupConLoss's own original 1.0 (CLIP-ReID's value, tuned for
+  # comparing against one small batch's worth of identities): this loss compares against the full
+  # training set (751 identities / 12936 images) every step, and needs a sharper starting
+  # temperature to give a useful gradient at that scale from the first step onward.
   temperature: 0.1
 
 logging:

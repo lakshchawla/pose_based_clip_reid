@@ -1,32 +1,27 @@
-"""Bidirectional relational attention across a person's K body-part tokens, applied on both the
-visual side (VisualAttentionBlock, over BPAM's pooled part features) and the text side
-(TextualAttentionBlock, over PromptLearner's per-part learnable context tokens) -- see
-progress.md's entry on this change for the full design rationale.
+"""Bidirectional relational attention across a person's M=1+K branches (global/foreground + K
+parts, uniformly), applied on both the visual side (VisualAttentionBlock, over BPBreID's pooled
+branch features) and the text side (TextualAttentionBlock, over PromptLearner's per-branch
+learnable context tokens).
 
-Both blocks are now visibility-aware (see changes.md's "Red flag 6" / plans/IMPROVEMENT_PLAN.md section
-5 for the full rationale): every image, including fully-occluded ones, still reaches both blocks
-unfiltered (the upstream image-level filter, pcr/utils/visibility_filter.py, was removed entirely
--- see progress.md's entry on the visibility-filter-to-weighting refactor), but each block now uses
-a per-part reliability score as a soft bias on its own self-attention, so a poorly-visible part's
-near-garbage token contributes less as a KEY to every other part's post-attention representation --
-closing the contamination gap that loss-level weighting (SupConLoss, CosineAlignLoss,
-PartTripletLoss) alone could never reach, since those only discount a part's own direct loss
-contribution, never the mixing that already happened upstream of the loss.
+Both blocks are visibility-aware: every image, including fully-occluded ones, still reaches both
+blocks unfiltered, but each block uses a per-branch reliability score as a soft bias on its own
+self-attention, so a poorly-visible branch's near-garbage token contributes less as a KEY to every
+other branch's post-attention representation -- closing the contamination gap that loss-level
+weighting (SupConLoss, CosineAlignLoss, PartTripletLoss) alone could never reach, since those only
+discount a branch's own direct loss contribution, never the mixing that already happened upstream
+of the loss.
 
-VisualAttentionBlock uses each image's own, real per-part visibility (available fresh at every
+VisualAttentionBlock uses each image's own, real per-branch visibility (available fresh at every
 forward call, in both Stage 1 and Stage 2). TextualAttentionBlock has no such per-image signal --
-PromptLearner.part_ctx is indexed by identity alone, with no per-image input at all -- so it uses a
-per-identity mean visibility instead (that identity's average reliability for each part, across
+PromptLearner.ctx is indexed by identity alone, with no per-image input at all -- so it uses a
+per-identity mean visibility instead (that identity's average reliability for each branch, across
 every cached training image of that identity), computed once in
 examples/train_relational_prompts.py and reused unchanged by examples/cache_text_anchors.py so the
 final frozen text prototypes are built with the exact same bias training converged against.
 
-Only foreground/global stays outside both blocks entirely, in this build: relational mixing
-covers the K=5 part branches (branches 1..K in BPBreIDEncoder's convention), not the foreground
-branch (branch 0). The source plan describes the foreground vector as an *optional* addition to
-VAB's input ("the K part vectors... optionally plus the foreground vector") rather than the base
-case, so this keeps to the base case -- foreground keeps its own independent embedding and its
-own independent prompt, unmixed, exactly as before this file existed.
+Global/foreground (branch 0) is mixed in on equal footing with the K parts -- both blocks treat
+it as just another branch, so it receives real gradient (via Stage 1's SupCon loss, extended to
+cover all M branches) instead of sitting outside training entirely.
 """
 import torch
 import torch.nn as nn
@@ -62,11 +57,28 @@ def _visibility_attn_bias(visibility, num_heads, eps=1e-6):
     return bias.unsqueeze(1).expand(B, num_heads, L, L).reshape(B * num_heads, L, L)
 
 
+def _replay_with_attention(encoder, x, mask):
+    """Manually replays a norm_first nn.TransformerEncoder's own layers with need_weights=True --
+    nn.TransformerEncoderLayer.forward always discards attention weights (need_weights=False,
+    hardcoded in its _sa_block). Returns (output, last layer's attention [B, L, L], heads
+    averaged) -- both VAB and TAB use single-layer encoders today, so "last layer" is the only
+    layer; a deeper stack would only expose its final layer's pattern this way."""
+    attn = None
+    for layer in encoder.layers:
+        normed = layer.norm1(x)
+        sa_out, attn = layer.self_attn(normed, normed, normed, attn_mask=mask,
+                                        need_weights=True, average_attn_weights=True)
+        x = x + layer.dropout1(sa_out)
+        x = x + layer._ff_block(layer.norm2(x))
+    return x, attn
+
+
 class VisualAttentionBlock(nn.Module):
-    """Bidirectional self-attention over the K pooled part-feature vectors (image side).
-    Permanent inference-time module: trained in Stage 1 (backbone/BPAM frozen, this is one of
-    the few trainable things), then carried over and continues training in Stage 2 (jointly with
-    the now-unfrozen backbone) -- never discarded, unlike TextualAttentionBlock.
+    """Bidirectional self-attention over the M=1+K pooled branch features (image side): global/
+    foreground and all K parts, mixed uniformly. Permanent inference-time module: trained in
+    Stage 1 (backbone/BPAM frozen, this is one of the few trainable things), then carried over and
+    continues training in Stage 2 (jointly with the now-unfrozen backbone) -- never discarded,
+    unlike TextualAttentionBlock.
 
     A learned, zero-initialized residual gate keeps this a no-op at initialization
     (`tanh(0) == 0`, so `forward` returns `part_tokens` unchanged the moment training starts) and
@@ -99,23 +111,26 @@ class VisualAttentionBlock(nn.Module):
         self.gate = nn.Parameter(torch.zeros(1))
         self.num_heads = num_heads
 
-    def forward(self, part_tokens, part_visibility):
-        """part_tokens: [B, K, C] pooled part features (K=5 parts, not including foreground).
-        part_visibility: [B, K], that same image's own per-part visibility score (same branch
-        order as part_tokens) -- used as a soft attention bias so a poorly-visible part's
-        near-garbage feature contributes less as a key to every other part's post-attention
-        representation. Returns [B, K, C], same shape, relationally mixed and L2-normalized."""
-        attn_bias = _visibility_attn_bias(part_visibility, self.num_heads)
-        relation_out = self.encoder(part_tokens, mask=attn_bias)
-        mixed = part_tokens + torch.tanh(self.gate) * relation_out
-        return F.normalize(mixed, p=2, dim=-1)
+    def forward(self, branch_tokens, branch_visibility):
+        """branch_tokens: [B, M, C] pooled branch features (M=1+K: global/foreground + K parts).
+        branch_visibility: [B, M], that same image's own per-branch visibility score (same branch
+        order as branch_tokens) -- used as a soft attention bias so a poorly-visible branch's
+        near-garbage feature contributes less as a key to every other branch's post-attention
+        representation. Returns (mixed [B, M, C], attn [B, M, M]) -- mixed is relationally mixed
+        and L2-normalized; attn is this call's own self-attention pattern (see
+        train_relational_prompts.py's L_relalign, which is the only current consumer)."""
+        attn_bias = _visibility_attn_bias(branch_visibility, self.num_heads)
+        relation_out, attn = _replay_with_attention(self.encoder, branch_tokens, attn_bias)
+        mixed = branch_tokens + torch.tanh(self.gate) * relation_out
+        return F.normalize(mixed, p=2, dim=-1), attn
 
 
 class TextualAttentionBlock(nn.Module):
-    """Bidirectional self-attention over a person's K*n_ctx learnable part-context tokens (text
-    side), run before any single part's prompt is assembled -- so a part's context can be
-    informed by every other part's, which the frozen CLIP text encoder's own causally-masked
-    self-attention can never provide on its own (a token can only attend to earlier tokens there).
+    """Bidirectional self-attention over a person's M*n_ctx learnable branch-context tokens (text
+    side, M=1+K: global/foreground + K parts), run before any single branch's prompt is assembled
+    -- so a branch's context can be informed by every other branch's, which the frozen CLIP text
+    encoder's own causally-masked self-attention can never provide on its own (a token can only
+    attend to earlier tokens there).
 
     Training-only: exists solely within Stage 1, alongside PromptLearner. Both are frozen and
     discarded once Stage 1 ends -- cache_text_anchors.py reads their state once to build the
@@ -136,17 +151,31 @@ class TextualAttentionBlock(nn.Module):
         self.n_ctx = n_ctx
         self.num_heads = num_heads
 
-    def forward(self, ctx_tokens, part_visibility):
-        """ctx_tokens: [B, K*n_ctx, ctx_dim] -- one batch's raw per-identity part context, laid
-        out as K contiguous n_ctx-token blocks (see PromptLearner.build_part_prompts's own
-        slicing). part_visibility: [B, K], that identity's mean per-part visibility across every
-        cached training image of that identity (there is no single per-image signal here --
-        part_ctx has no per-image input at all, see PromptLearner's own docstring) -- expanded so
-        every context token belonging to a given part shares that part's score. Returns the same
-        shape, relationally mixed."""
-        token_visibility = part_visibility.repeat_interleave(self.n_ctx, dim=1)  # [B, K*n_ctx]
+    def forward(self, ctx_tokens, branch_visibility):
+        """ctx_tokens: [B, M*n_ctx, ctx_dim] -- one batch's raw per-identity branch context, laid
+        out as M contiguous n_ctx-token blocks (see PromptLearner.build_part_prompts's own
+        slicing). branch_visibility: [B, M], that identity's mean per-branch visibility across
+        every cached training image of that identity (there is no single per-image signal here --
+        ctx has no per-image input at all, see PromptLearner's own docstring) -- expanded so every
+        context token belonging to a given branch shares that branch's score. Returns
+        (mixed [B, M*n_ctx, ctx_dim], attn [B, M, M]) -- mixed is the same shape, relationally
+        mixed; attn is the raw [B, M*n_ctx, M*n_ctx] self-attention pattern reduced to one M x M
+        branch-to-branch summary: summed over each key branch's own n_ctx tokens (each query row
+        sums to 1 over the full M*n_ctx keys, so summing -- not averaging -- a key block preserves
+        that row's total probability mass), then averaged over each query branch's own n_ctx rows
+        (a mean of several valid distributions is itself a valid distribution). Needed as a real
+        probability distribution, each row summing to 1, since L_relalign
+        (train_relational_prompts.py) feeds this into a KL divergence against VAB's native
+        [B, M, M] -- naively averaging over both axes (as a purely-visual heatmap wouldn't need to
+        care about) leaves each row summing to 1/n_ctx instead, silently breaking KL's
+        non-negativity."""
+        M = branch_visibility.size(1)
+        token_visibility = branch_visibility.repeat_interleave(self.n_ctx, dim=1)  # [B, M*n_ctx]
         attn_bias = _visibility_attn_bias(token_visibility, self.num_heads)
-        return self.encoder(ctx_tokens, mask=attn_bias)
+        mixed, attn_full = _replay_with_attention(self.encoder, ctx_tokens, attn_bias)
+        B = attn_full.size(0)
+        attn = attn_full.view(B, M, self.n_ctx, M, self.n_ctx).sum(dim=4).mean(dim=2)
+        return mixed, attn
 
 
 class CrossAttentionBlock(nn.Module):

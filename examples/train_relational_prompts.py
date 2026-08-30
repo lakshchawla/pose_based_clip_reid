@@ -18,6 +18,7 @@ from pcr.models.clip_text_encoder import ClipTextEncoder
 from pcr.models.prompt_learner import PromptLearner
 from pcr.models.relation_blocks import VisualAttentionBlock
 from pcr.loss.clip_supcon_loss import SupConLoss
+from pcr.loss.cross_attn_align_loss import cross_attention_alignment_loss
 from pcr.utils.config import load_yaml_config
 from pcr.utils.data import transforms as T
 from pcr.utils.data.preprocessor import Preprocessor
@@ -60,7 +61,7 @@ def cache_part_features(encoder, data_loader):
 def compute_identity_visibility(cached_visibility, cached_labels, num_identities):
     """cached_visibility: [N, 1+K] (per-image, from cache_part_features). cached_labels: [N].
     Returns [num_identities, 1+K]: each identity's mean visibility across every cached image of
-    that identity. TextualAttentionBlock has no per-image signal available (PromptLearner.part_ctx
+    that identity. TextualAttentionBlock has no per-image signal available (PromptLearner.ctx
     is indexed by identity alone -- see relation_blocks.py's own docstring), so this is the
     per-identity substitute passed into it as its attention bias; saved to disk
     (identity_visibility.pth) so examples/cache_text_anchors.py can reuse the exact same values
@@ -74,23 +75,24 @@ def compute_identity_visibility(cached_visibility, cached_labels, num_identities
     return sums / counts.unsqueeze(1).clamp(min=1)
 
 
-def build_text_snapshot(prompt_learner, text_encoder, num_identities, num_parts,
+def build_text_snapshot(prompt_learner, text_encoder, num_identities, num_branches,
                          identity_visibility, id_batch):
-    """Full-dataset text-anchor snapshot, [num_identities, num_parts, D], rebuilt once at the
-    start of every epoch (not every iteration -- see main_worker's own call site) under no_grad,
-    using the model's CURRENT part_ctx/TextualAttentionBlock weights. This is what widens Stage
-    1's negative pool from "the ~8 identities in one PK batch" to "every identity in the training
+    """Full-dataset text-anchor snapshot, [num_identities, num_branches, D] (branch 0 =
+    global/foreground, 1..K = parts), rebuilt once at the start of every epoch (not every
+    iteration -- see main_worker's own call site) under no_grad, using the model's CURRENT
+    ctx/TextualAttentionBlock weights. This is what widens Stage 1's negative pool from "the ~8
+    identities in one PK batch" to "every identity in the training
     set", matching CLIP-ReID's own original Stage 1 design (full-identity-table classification,
     not a batch-restricted one) -- see plans/IMPROVEMENT_PLAN.md section 4 and progress.md's entry on
     this change for the full reasoning.
 
     Only used as a *negative* pool for identities NOT present in the current PK batch (see
     main_worker's own per-iteration splicing) -- an identity that IS in the current batch gets a
-    fresh, differentiable re-encoding instead, since gradient must still reach part_ctx/TAB for it.
+    fresh, differentiable re-encoding instead, since gradient must still reach ctx/TAB for it.
     A once-per-epoch refresh (rather than once per iteration) keeps this affordable: rebuilding it
     costs one extra CLIP-text forward pass over the whole identity set, not per training step, and
     a whole epoch's worth of iterations (hundreds) is far more than enough for the small
-    per-iteration drift in part_ctx/TAB to matter for what is, after all, only a negative-comparison
+    per-iteration drift in ctx/TAB to matter for what is, after all, only a negative-comparison
     pool, not something being directly optimized against.
 
     TextualAttentionBlock's own attention only mixes tokens *within* one identity's own K*n_ctx-
@@ -99,20 +101,20 @@ def build_text_snapshot(prompt_learner, text_encoder, num_identities, num_parts,
     every identity one at a time -- no cross-identity leakage or batching-order sensitivity."""
     prompt_learner.eval()
     D = text_encoder.embed_dim
-    snapshot = torch.zeros(num_identities, num_parts, D, device='cuda')
+    snapshot = torch.zeros(num_identities, num_branches, D, device='cuda')
     with torch.no_grad():
         for start in range(0, num_identities, id_batch):
             ids = torch.arange(start, min(start + id_batch, num_identities), device='cuda')
-            part_vis = identity_visibility[ids, 1:]
-            prompts = prompt_learner.build_part_prompts(ids, part_vis)
-            for k in range(num_parts):
-                text_feat = text_encoder(prompts[1 + k], prompt_learner.tokenized_prompts).float()
+            branch_vis = identity_visibility[ids]
+            prompts, _ = prompt_learner.build_part_prompts(ids, branch_vis)
+            for b in range(num_branches):
+                text_feat = text_encoder(prompts[b], prompt_learner.tokenized_prompts).float()
                 # L2-normalized before storing -- see this file's own module docstring (the
                 # "SupCon" mapping-table entry) for why: SupConLoss's dot product only behaves as
                 # a real cosine similarity, matching its temperature's calibration, if both sides
-                # are unit-norm -- part_visual (the image side) already is; this was the one place
+                # are unit-norm -- branch_visual (the image side) already is; this was the one place
                 # text wasn't.
-                snapshot[ids, k] = F.normalize(text_feat, p=2, dim=-1)
+                snapshot[ids, b] = F.normalize(text_feat, p=2, dim=-1)
     return snapshot
 
 
@@ -146,6 +148,19 @@ def build_pk_batches(cached_labels, num_instances, batch_size):
             batch_idx.extend(int(i) for i in chosen)
         batches.append(torch.tensor(batch_idx, dtype=torch.long, device=cached_labels.device))
     return batches
+
+
+def relalign_schedule(epoch, total_epochs, relalign_cfg):
+    """0 during warmup, then a linear ramp up to relalign_lambda_max, then flat -- same shape as
+    examples/train_relational_finetune.py's crossalign_schedule."""
+    warmup_end = relalign_cfg.warmup_fraction * total_epochs
+    ramp_end = warmup_end + relalign_cfg.ramp_fraction * total_epochs
+    if epoch < warmup_end:
+        return 0.0
+    if epoch >= ramp_end:
+        return relalign_cfg.lambda_max
+    progress = (epoch - warmup_end) / (ramp_end - warmup_end)
+    return relalign_cfg.lambda_max * progress
 
 
 def build_encoder(cfg):
@@ -221,11 +236,9 @@ def main_worker(cfg, setup_only=False):
         num_images, num_identities, num_branches))
 
     if setup_only:
-        print('==> Setup complete: {} branches, {} cached images, part_ctx shape {} (trainable), '
-              'fg_ctx shape {} (untrained -- see module docstring). Exiting before the training '
-              'loop (--setup-only).'.format(
-                  num_branches, num_images, tuple(prompt_learner.part_ctx.shape),
-                  tuple(prompt_learner.fg_ctx.shape)))
+        print('==> Setup complete: {} branches, {} cached images, ctx shape {} (trainable). '
+              'Exiting before the training loop (--setup-only).'.format(
+                  num_branches, num_images, tuple(prompt_learner.ctx.shape)))
         return
 
     # Per-identity mean visibility -- TextualAttentionBlock's attention bias (see
@@ -234,10 +247,11 @@ def main_worker(cfg, setup_only=False):
     identity_visibility = compute_identity_visibility(cached_visibility, cached_labels, num_identities)
 
     supcon = SupConLoss(temperature=cfg.loss.temperature).cuda()
-    # fg_ctx deliberately excluded -- Algorithm 1 has no foreground term (see module docstring);
-    # only part_ctx, TextualAttentionBlock (prompt_learner.tab), and VisualAttentionBlock train.
-    trainable_params = ([prompt_learner.part_ctx] + list(prompt_learner.tab.parameters())
-                         + list(vab.parameters()))
+    # ctx (all M=1+K branches, global/foreground included), TextualAttentionBlock
+    # (prompt_learner.tab), VisualAttentionBlock, and SupConLoss's own learnable temperature
+    # (see that file's own docstring) all train.
+    trainable_params = ([prompt_learner.ctx] + list(prompt_learner.tab.parameters())
+                         + list(vab.parameters()) + list(supcon.parameters()))
     optimizer = torch.optim.Adam(trainable_params, lr=cfg.optim.lr,
                                   weight_decay=cfg.optim.weight_decay)
     scheduler = WarmupCosineLR(optimizer, max_epochs=cfg.optim.epochs,
@@ -254,10 +268,10 @@ def main_worker(cfg, setup_only=False):
 
     for epoch in range(cfg.optim.epochs):
         # Refresh the full-identity text-anchor snapshot once per epoch, against this epoch's
-        # part_ctx/TAB weights -- see build_text_snapshot's own docstring. Puts prompt_learner in
+        # ctx/TAB weights -- see build_text_snapshot's own docstring. Puts prompt_learner in
         # eval() mode briefly; explicitly switched back to train() below before any real training
         # step runs.
-        text_snapshot = build_text_snapshot(prompt_learner, text_encoder, num_identities, num_parts,
+        text_snapshot = build_text_snapshot(prompt_learner, text_encoder, num_identities, num_branches,
                                              identity_visibility, cfg.data.cache_batch_size)
         prompt_learner.train()
         vab.train()
@@ -275,11 +289,12 @@ def main_worker(cfg, setup_only=False):
 
             optimizer.zero_grad()
 
-            # Algorithm 1 steps 10-14: only the K part prompts are built and pushed through the
-            # frozen CLIP text encoder -- no foreground prompt/loss (module docstring).
+            # Algorithm 1 steps 10-14, extended to all M=1+K branches (global/foreground + K
+            # parts, uniformly -- see relation_blocks.py's own module docstring): every branch's
+            # prompt is built and pushed through the frozen CLIP text encoder.
             id_vis = identity_visibility[b_labels]  # [b, 1+K], TAB's per-identity bias
-            prompts = prompt_learner.build_part_prompts(b_labels, id_vis[:, 1:])  # list of 1+K tensors
-            part_visual = vab(b_features[:, 1:, :], b_vis[:, 1:])  # [b, K, D], relationally mixed
+            prompts, A_text = prompt_learner.build_part_prompts(b_labels, id_vis)  # list of 1+K tensors
+            branch_visual, A_vis = vab(b_features, b_vis)  # [b, 1+K, D], relationally mixed
 
             # Identities NOT in this batch -- their text row comes from this epoch's (detached)
             # snapshot instead of a fresh re-encoding, widening i2t's negative pool to the full
@@ -289,29 +304,39 @@ def main_worker(cfg, setup_only=False):
             other_ids = in_batch.logical_not().nonzero(as_tuple=True)[0]
 
             # Algorithm 1 step 15 (loss_i2t + loss_t2i), via SupConLoss's own two-call convention
-            # (see that file's docstring).
+            # (see that file's docstring), summed over all M=1+K branches.
             loss = b_features.new_zeros(())
-            for k in range(num_parts):
-                # L2-normalized -- see build_text_snapshot's own comment on why: visual_k (below)
+            for m in range(num_branches):
+                # L2-normalized -- see build_text_snapshot's own comment on why: visual_m (below)
                 # is already unit-norm, and SupConLoss's dot product only behaves as a real cosine
                 # similarity, matching its own temperature, if both sides are.
-                part_text = F.normalize(
-                    text_encoder(prompts[1 + k], prompt_learner.tokenized_prompts).float(), p=2, dim=-1)
-                visual_k = part_visual[:, k, :]
-                w_k = b_vis[:, 1 + k]  # same 1+k branch offset as prompts[1+k]/part_visual[:,k,:]
+                branch_text = F.normalize(
+                    text_encoder(prompts[m], prompt_learner.tokenized_prompts).float(), p=2, dim=-1)
+                visual_m = branch_visual[:, m, :]
+                w_m = b_vis[:, m]
 
                 # i2t: full num_identities-way classification, not just this batch's ~8 -- this
                 # batch's own identities keep their fresh, differentiable text row (gradient must
-                # reach part_ctx/TAB for them); every other identity is a detached negative from
-                # this epoch's text_snapshot.
-                other_text = torch.cat([part_text, text_snapshot[other_ids, k, :]], dim=0)
+                # reach ctx/TAB for them); every other identity is a detached negative from this
+                # epoch's text_snapshot.
+                other_text = torch.cat([branch_text, text_snapshot[other_ids, m, :]], dim=0)
                 other_text_labels = torch.cat([b_labels, other_ids], dim=0)
-                loss = loss + supcon(visual_k, other_text, b_labels, other_text_labels, w_k)
+                loss = loss + supcon(visual_m, other_text, b_labels, other_text_labels, w_m)
 
                 # t2i: full-dataset classification -- every cached image, not just this batch's,
                 # is a comparison point. No snapshot/splicing needed here at all: cached_features
                 # never goes stale, since the backbone/BPAM are frozen for the whole of Stage 1.
-                loss = loss + supcon(part_text, cached_features[:, 1 + k, :], b_labels, cached_labels, w_k)
+                loss = loss + supcon(branch_text, cached_features[:, m, :], b_labels, cached_labels, w_m)
+
+            # L_relalign: pushes VAB's own branch-to-branch attention pattern (A_vis, per-image)
+            # toward TAB's (A_text, per-identity, detached -- this loss trains VAB, not TAB) -- a
+            # direct regularizer against both blocks converging to degenerate, near-identical
+            # relational patterns across branches (prompt/branch-embedding collapse), on top of
+            # whatever the SupCon gradient above already does. Ramped in on a schedule since both
+            # blocks' patterns are meaningless before SupCon has shaped them at all.
+            lambda_relalign = relalign_schedule(epoch, cfg.optim.epochs, cfg.relalign)
+            l_relalign = cross_attention_alignment_loss(A_vis, A_text.detach())
+            loss = loss + lambda_relalign * l_relalign
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -319,13 +344,13 @@ def main_worker(cfg, setup_only=False):
             epoch_loss += loss.item()
 
             if (it + 1) % cfg.logging.print_freq == 0:
-                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\tLR {:.2e}\tVAB gate {:.3f}'.format(
+                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\tLR {:.2e}\tVAB gate {:.3f}\trelalign {:.4f} (x{:.2f})'.format(
                     epoch, it + 1, iters_per_epoch, loss.item(), optimizer.param_groups[0]['lr'],
-                    torch.tanh(vab.gate).item()))
+                    torch.tanh(vab.gate).item(), l_relalign.item(), lambda_relalign))
 
         scheduler.step()
-        print('Epoch {} done in {:.1f}s, avg loss {:.4f}'.format(
-            epoch, time.time() - epoch_start, epoch_loss / iters_per_epoch))
+        print('Epoch {} done in {:.1f}s, avg loss {:.4f}, SupCon temperature {:.4f}'.format(
+            epoch, time.time() - epoch_start, epoch_loss / iters_per_epoch, supcon.temperature.item()))
 
     torch.save(prompt_learner.state_dict(), osp.join(cfg.logging.logs_dir, 'prompt_learner.pth'))
     torch.save(vab.state_dict(), osp.join(cfg.logging.logs_dir, 'vab.pth'))

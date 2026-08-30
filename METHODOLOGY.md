@@ -57,51 +57,52 @@ Every branch's embedding is L2-normalized independently before leaving the encod
 backbone/BPAM (from Stage 0) and CLIP's text encoder are both frozen; only a per-identity prompt
 context and two small attention blocks train.
 
-**Prompt construction** (`pcr/models/prompt_learner.py`). Each identity owns two learnable context
-tensors: `fg_ctx` (foreground, never trained — Algorithm 1 has no foreground loss term, see below)
-and `part_ctx` (all $K$ parts, laid out as one flat sequence so they can attend to each other).
-Both splice into the fixed template `"A photo of a [ctx] person."` before the frozen CLIP text
-encoder ever sees them.
+**Prompt construction** (`pcr/models/prompt_learner.py`). Each identity owns one learnable context
+tensor, `ctx`, covering all $M=1{+}K$ branches uniformly (global/foreground + $K$ parts) — laid out
+as one flat sequence so they can all attend to each other. It splices into the fixed template
+`"A photo of a [ctx] person."` before the frozen CLIP text encoder ever sees it. (Earlier versions
+of this design kept the global/foreground branch as a separate, untrained `fg_ctx` outside the
+relational-mixing step entirely; unified into `ctx` so branch 0 receives real gradient like every
+part, and CAB/$\mathcal{L}_{\text{align}}$ in Stage 2 don't have to special-case a meaningless
+anchor for it.)
 
-**TextualAttentionBlock (TAB)** (`pcr/models/relation_blocks.py`) mixes `part_ctx`'s $K$ blocks via
-self-attention before any part's prompt is assembled, so one part's context can be informed by the
-others. It has no per-image signal to work with (`part_ctx` is indexed by identity alone), so it
-uses each identity's *mean* per-part visibility across every cached training image of that
-identity (`compute_identity_visibility`) as a soft attention-score bias — an unreliable part
-contributes less as a key to every other part's post-attention representation. This table is saved
-(`identity_visibility.pth`) and reused unchanged by `cache_text_anchors.py`, so TAB's output stays
-a deterministic function of identity alone everywhere it's used.
+**TextualAttentionBlock (TAB)** (`pcr/models/relation_blocks.py`) mixes `ctx`'s $M$ blocks via
+self-attention before any branch's prompt is assembled, so one branch's context can be informed by
+the others. It has no per-image signal to work with (`ctx` is indexed by identity alone), so it
+uses each identity's *mean* per-branch visibility across every cached training image of that
+identity (`compute_identity_visibility`) as a soft attention-score bias — an unreliable branch
+contributes less as a key to every other branch's post-attention representation. This table is
+saved (`identity_visibility.pth`) and reused unchanged by `cache_text_anchors.py`, so TAB's output
+stays a deterministic function of identity alone everywhere it's used.
 
 **VisualAttentionBlock (VAB)**, the image-side counterpart, uses the same attention-bias mechanism
-but with each image's own real per-part visibility (available fresh every forward call). A
-zero-init tanh-gated residual keeps it a no-op at initialization; VAB is the one Stage 1 module
-that survives into Stage 2.
+but with each image's own real per-branch visibility (available fresh every forward call), also
+over all $M$ branches uniformly. A zero-init tanh-gated residual keeps it a no-op at
+initialization; VAB is the one Stage 1 module that survives into Stage 2.
 
 **Loss — SupConLoss** (`pcr/loss/clip_supcon_loss.py`), CLIP-ReID's actual multi-positive
 contrastive loss, not plain InfoNCE (PK-sampled batches put several images of the same identity in
 one batch on purpose; SupCon's positive mask already handles that, InfoNCE would need a
 deduplication patch that throws away all but one photo's gradient). Both i2t and t2i directions are
-computed per part $k$, with $\tau = 0.1$:
+computed for every branch $m \in \{0..K\}$ (global/foreground included), with learnable $\tau$:
 
 $$\mathcal{L}_{\text{SupCon}} = -\sum_{i} \frac{v_i}{\sum_j v_j} \cdot \frac{1}{|P(i)|}\sum_{p \in P(i)} \log \frac{\exp(z_i \cdot z_p / \tau)}{\sum_{a} \exp(z_i \cdot z_a / \tau)}$$
 
 where $P(i)$ is every same-identity row on the other side, and each anchor is weighted by its own
-visibility ($v_i$, detached, floored at $10^{-3}$). $\tau=0.1$ (not SupCon's original $1.0$) because
-of the next point:
+visibility ($v_i$, detached, floored at $10^{-3}$). $\tau$ is **learnable** — parameterized as
+$\tau = 1/\exp(s)$ with $s$ (`log_logit_scale`) a trained parameter, clamped so $\exp(s)\le100$
+(i.e. $\tau \ge 0.01$), following CLIP's own `logit_scale` convention
+(`third_party/clip/model.py`). Initialized at $\tau=0.1$ (not SupCon's original $1.0$, which
+produced a near-random-guess loss for the first two epochs against this loss's full-identity-table
+scale — see below) and logged every epoch.
 
 **Full-identity-table negative pool.** Both directions compare against the *entire* training set,
 not just the current PK batch (751 identities / 12936 images on Market1501) — matching CLIP-ReID's
 own original design. i2t achieves this by splicing each batch's fresh, differentiable text row
 together with a once-per-epoch snapshot of every *other* identity's text embedding
 (`build_text_snapshot`, rebuilt under `no_grad` at the start of each epoch against that epoch's
-current TAB/`part_ctx` weights). t2i simply compares against the whole cached feature set directly,
-since the backbone is frozen and `cached_features` never goes stale. $\tau=1.0$ (SupCon's original
-value) produced a near-random-guess loss for the first two epochs at this scale; $\tau=0.1$ clears
-that floor markedly faster.
-
-**No foreground loss term.** Only $k=1..K$ contribute to the loss sum — Algorithm 1 extracts
-BPAM's global/foreground feature but never uses it in a loss. `fg_ctx` is therefore excluded from
-the optimizer entirely and stays at its random initialization after Stage 1.
+current TAB/`ctx` weights). t2i simply compares against the whole cached feature set directly,
+since the backbone is frozen and `cached_features` never goes stale.
 
 **No upstream visibility filter.** Every cached image trains, unconditionally — the old
 image-level filter (`pcr/utils/visibility_filter.py`, deleted) discarded 61% of Market1501's
@@ -109,11 +110,23 @@ training images and was found to be driven by an undertrained BPAM signal rather
 occlusion. Reliability is handled entirely by the two mechanisms above: attention-level masking
 (VAB/TAB) and loss-level per-row weighting (SupCon's `weights`).
 
+**$\mathcal{L}_{\text{relalign}}$**: both VAB and TAB now return their own attention pattern
+alongside their mixed output (`VisualAttentionBlock`/`TextualAttentionBlock.forward` →
+`(mixed, attn)`; TAB's raw $M{\cdot}n_{ctx} \times M{\cdot}n_{ctx}$ pattern is averaged down to
+$M\times M$ per branch block first, to match VAB's native shape). A KL-divergence term
+(`pcr/loss/cross_attn_align_loss.py`, the same function Stage 2's $\mathcal{L}_{\text{crossalign}}$
+uses) pulls VAB's per-image pattern toward TAB's per-identity one (detached — this trains VAB, not
+TAB), on the same warmup/ramp/flat schedule shape as Stage 2's. Guards against both blocks
+converging to a degenerate, near-identical relational pattern across branches — a real failure mode
+distinct from what SupCon's own gradient already discourages, since SupCon never looks at either
+block's *attention pattern*, only its final mixed output.
+
 **Outputs**: `prompt_learner.pth`, `vab.pth`, `identity_visibility.pth` — consumed by
 `examples/cache_text_anchors.py`, which builds two frozen, per-identity lookup tables for Stage 2:
 
 - `text_prototypes.pth`: `[num_identities, M, D]`, each identity's per-branch pooled text embedding
-  (unnormalized branch 0 included, but never read downstream — see Stage 2).
+  (L2-normalized), branch 0 (global/foreground) included — a real, SupCon-trained anchor, read
+  by Stage 2's $\mathcal{L}_{\text{align}}$ like every other branch.
 - `text_self_attention.pth`: `[num_identities, M, M]`, each identity's own CLIP text-transformer
   self-attention among those $M$ branch embeddings (see Stage 2 / CAB, below) — computed by
   replaying the text transformer's last block with `need_weights=True` (third_party/clip hardcodes
@@ -132,7 +145,8 @@ backbone + BPAM unfreeze here (initialized from the *same* Stage 0 checkpoint St
 in); VAB continues training from its Stage 1 weights. Stage 1's prompt learner and the CLIP text
 encoder are never loaded — only the two frozen tables they produced.
 
-Per iteration: `combined = [f_0, \text{VAB}(f_1..f_K, v_1..v_K)]`, one `[B, M, D]` tensor.
+Per iteration: `combined = VAB(f_0..f_K, v_0..v_K)`, one `[B, M, D]` tensor — VAB mixes all $M$
+branches uniformly (see Stage 1, above).
 
 **CrossAttentionBlock (CAB)**, new in this design (`pcr/models/relation_blocks.py`). Stage 1's
 frozen text anchors describe BPAM's part definitions *as they were at the end of Stage 1* — but
@@ -172,10 +186,11 @@ default to an implicit weight of 1 except where noted):
   Visibility gates triplet with a loose boolean floor (`triplet_visibility_min`, default 0.05) since
   batch-hard mining's max/min doesn't compose with continuous weights the way the others do.
 - $\mathcal{L}_{\text{align}}$ (`pcr/loss/clip_cosine_align_loss.py`) — softmax classification of
-  each part's `vis_grounded` feature against that branch's full frozen prototype table (every other
-  identity is an implicit negative), weighted per-part by continuous visibility. Parts only
-  (branches 1..K) — `fg_ctx` was never trained in Stage 1, so `text_prototypes[:,0,:]` is
-  meaningless and is never read.
+  each branch's `vis_grounded` feature against that branch's full frozen prototype table (every
+  other identity is an implicit negative), weighted per-branch by continuous visibility. All
+  $M=1{+}K$ branches, global/foreground included — `text_prototypes[:,0,:]` is a real,
+  SupCon-trained anchor since Stage 1's unification (see Stage 1, above), not the untrained noise
+  an earlier version of this design left it as.
 - $\mathcal{L}_{\text{attn}}$ (`BodyPartAttentionLoss`, same pixel-supervision loss as Stage 0) —
   mandatory whenever masks are configured, so BPAM can't drift arbitrarily far from Stage 0/1's
   anatomical convention while everything else keeps training it. Its weight now cosine-decays
@@ -186,6 +201,13 @@ default to an implicit weight of 1 except where noted):
 BatchNorm1d per branch between the pooled feature and whichever of id/align reads it — triplet
 keeps reading the pre-BN feature) and a 10-epoch linear LR warmup before the just-unfrozen backbone
 and its newly-interacting losses hit full LR.
+
+**$\mathcal{L}_{\text{i2tce}}$, superseded**: a separate i2t classification loss for the global
+branch against a frozen text anchor was considered alongside CAB, but its only candidate anchor
+(`text_prototypes[:,0,:]`) was, at the time, untrained noise (`fg_ctx` had no Stage 1 loss term).
+Stage 1's branch-0 unification (above) resolves this at the root: $\mathcal{L}_{\text{align}}$
+already covers branch 0 with a real anchor now, making a separate $\mathcal{L}_{\text{i2tce}}$
+unnecessary.
 
 ## 6. Stage 3 — Self-Paced Unsupervised Domain Adaptation
 

@@ -50,6 +50,14 @@ temperature to produce a useful gradient at all -- confirmed directly: a real tr
 ln(num_images) * 5`) for roughly two full epochs before making visible progress; the same run at
 `0.1` cleared that floor markedly faster and further, using identical data and iteration count.
 
+Temperature is now **learnable**, not fixed, following third_party/clip/model.py's own
+`logit_scale` convention (CLIP's real training code does the same): parameterized as
+`log(1/temperature)` and exponentiated in `forward`, so gradient descent can push it in either
+direction without risking a negative or zero temperature, and clamped at `exp() <= 100`
+(temperature >= 0.01) so a runaway value can't blow the softmax up into numerical instability.
+`temperature=0.1` above is now only the *initial* value -- Stage 1 includes this module's own
+parameter in its optimizer and logs the converged value every epoch.
+
 `anchor_features`/`other_features` are both expected to already be L2-normalized by the caller
 (not enforced inside this class, matching pcr/loss/clip_cosine_align_loss.py's own convention of
 normalizing at the call site) -- otherwise `logits = anchor_features @ other_features.t()` is not
@@ -61,15 +69,23 @@ identity to identity, silently making the effective per-identity temperature inc
 call sites in examples/train_relational_prompts.py now normalize the text side explicitly before
 calling this class.
 """
+import math
+
 import torch
 import torch.nn as nn
 
 
 class SupConLoss(nn.Module):
+    MAX_LOGIT_SCALE = 100.0  # temperature >= 0.01 -- same clamp value as CLIP's own training code
+
     def __init__(self, temperature=0.1, weight_floor=1e-3):
         super(SupConLoss, self).__init__()
-        self.temperature = temperature
+        self.log_logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / temperature)))
         self.weight_floor = weight_floor
+
+    @property
+    def temperature(self):
+        return 1.0 / self.log_logit_scale.exp().clamp(max=self.MAX_LOGIT_SCALE)
 
     def forward(self, anchor_features, other_features, anchor_labels, other_labels, weights):
         """anchor_features: [Ba, D]. other_features: [Bo, D]. anchor_labels: [Ba]. other_labels:

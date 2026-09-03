@@ -13,7 +13,9 @@
 model:
   backbone: hrnet32          # or resnet50 -- must match whatever Stage 1/2 config loads this checkpoint
   checkpoint_path: ''        # optional external bpbreid checkpoint to continue from; empty = ImageNet init
-  dim_reduce_output: 512     # must equal clip.arch's text embed dim if Stage 1/2 will load this checkpoint
+  dim_reduce_output: 768     # must equal clip.arch's text embed dim if Stage 1/2 will load this checkpoint
+                              # (768 = ViT-L/14 and ViT-L/14@336px's -- see clip_text_encoder.py's own
+                              # docstring; bumped from 512/ViT-B-16 for richer per-branch embeddings)
   parts_num: 5                # K body parts; num_branches = 1 (foreground) + parts_num
 
 data:
@@ -33,6 +35,9 @@ optim:
   step_size: 20
 
 logging:
-  logs_dir: examples/logs/stage0_bpa
+  # Separate dir from the existing 512-dim run (examples/logs/stage0_bpa) -- that checkpoint's
+  # shapes don't match dim_reduce_output=768, so it can't be reused; this dir keeps both around
+  # rather than overwriting the working 512-dim checkpoint.
+  logs_dir: examples/logs/stage0_bpa_768
   print_freq: 10
   seed: 1

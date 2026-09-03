@@ -19,15 +19,15 @@ model:
   # Algorithm 2's own initialization step: load the SAME Stage 0 checkpoint Stage 1 used going in
   # (Stage 1 never updates backbone/BPAM, so this is that exact checkpoint, not a separate one) --
   # not ImageNet init, and not Stage 1's own output (Stage 1 produces no encoder checkpoint at all).
-  checkpoint_path: 'examples/logs/stage0_bpa/model_best.pth.tar'
-  dim_reduce_output: 512     # must match stage1's model.dim_reduce_output and clip.arch's text embed dim
+  checkpoint_path: 'examples/logs/stage0_bpa_768/model_best.pth.tar'
+  dim_reduce_output: 768     # must match stage1's model.dim_reduce_output and clip.arch's text embed dim
   parts_num: 5
 
 stage1:
   # directory produced by examples/train_relational_prompts.py + examples/cache_text_anchors.py --
   # reads text_prototypes.pth (the frozen alignment target) and vab.pth (VisualAttentionBlock's
   # Stage-1-trained starting weights, which this stage continues training) from here
-  prompt_dir: examples/logs/stage1_prompts
+  prompt_dir: examples/logs/stage1_prompts_768
 
 vab:
   num_heads: 4                 # must match stage1's vab.num_heads/num_layers -- these define the
@@ -110,7 +110,7 @@ optim:
   warmup_factor: 0.01
 
 logging:
-  logs_dir: examples/logs/stage2_finetune
+  logs_dir: examples/logs/stage2_finetune_768   # separate from the 512-dim run's own dir
   print_freq: 10
   eval_step: 10
   seed: 1

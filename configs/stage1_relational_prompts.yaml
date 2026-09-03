@@ -17,14 +17,21 @@ model:
   # Algorithm 1's own initialization step: load Stage 0's converged checkpoint, not ImageNet
   # init -- run examples/train_bpa_segmentation.py first (configs/stage0_bpa_segmentation.yaml)
   # to produce this file.
-  checkpoint_path: 'examples/logs/stage0_bpa/model_best.pth.tar'
-  dim_reduce_output: 512     # must equal clip.arch's text embed dim (512 for ViT-B/32 and ViT-B/16)
+  checkpoint_path: 'examples/logs/stage0_bpa_768/model_best.pth.tar'
+  dim_reduce_output: 768     # must equal clip.arch's text embed dim (768 for ViT-L/14 and ViT-L/14@336px)
   parts_num: 5                # K body parts; num_branches = 1 (foreground) + parts_num
 
 clip:
-  arch: ViT-B/16               # 512-dim text embedding, matching model.dim_reduce_output above --
-                                # see pcr/models/clip_text_encoder.py's own docstring for other archs' sizes
-  n_ctx: 4                    # learnable context tokens per (identity, branch)
+  arch: ViT-L/14@336px         # 768-dim text embedding, matching model.dim_reduce_output above --
+                                # transformer_width also 768 (== embed_dim, verified directly) so
+                                # pcr/models/clip_text_encoder.py's encode_branch_self_attention
+                                # (CAB's Stage 2 precompute step) stays valid -- see that method's
+                                # own assertion. See clip_text_encoder.py's own docstring for other
+                                # archs' sizes.
+  n_ctx: 8                    # learnable context tokens per (identity, branch) -- bumped from 4;
+                                # safe now that PromptLearner measures the frozen prefix's real
+                                # token length instead of assuming it equals n_ctx (see that
+                                # class's own docstring)
 
 tab:
   num_heads: 4                 # TextualAttentionBlock's attention heads, over all M=1+K branches
@@ -75,6 +82,6 @@ loss:
   temperature: 0.1
 
 logging:
-  logs_dir: examples/logs/stage1_prompts
+  logs_dir: examples/logs/stage1_prompts_768   # separate from the 512-dim run's own dir
   print_freq: 10
   seed: 1

@@ -153,7 +153,7 @@ class TextualAttentionBlock(nn.Module):
 
     def forward(self, ctx_tokens, branch_visibility):
         """ctx_tokens: [B, M*n_ctx, ctx_dim] -- one batch's raw per-identity branch context, laid
-        out as M contiguous n_ctx-token blocks (see PromptLearner.build_part_prompts's own
+         out as M contiguous n_ctx-token blocks (see PromptLearner.build_part_prompts's own
         slicing). branch_visibility: [B, M], that identity's mean per-branch visibility across
         every cached training image of that identity (there is no single per-image signal here --
         ctx has no per-image input at all, see PromptLearner's own docstring) -- expanded so every

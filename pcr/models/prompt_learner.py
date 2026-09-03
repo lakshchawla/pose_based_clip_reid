@@ -13,9 +13,13 @@ from .relation_blocks import TextualAttentionBlock
 class PromptLearner(nn.Module):
     """n_ctx serves two purposes that CLIP-ReID's original code keeps as two separately-named
     variables (n_ctx, n_cls_ctx) always set to the same literal 4: the number of "X" placeholder
-    tokens in the fixed template (which determines where the frozen prefix ends and suffix
-    begins), and the length of the learnable context spliced into their place. One name here
-    instead of two, since they must always be equal for the prefix/suffix slicing to line up.
+    tokens in the fixed template, and the length of the learnable context spliced into their
+    place. One name here instead of two, since they must always be equal for the splicing to
+    line up. The frozen prefix's own real length ("SOT + 'a photo of a'") is measured separately
+    below, independent of n_ctx -- it used to be assumed equal to n_ctx+1, which only happened to
+    hold at n_ctx=4 (that phrase's own real token count) and silently corrupted the prompt at any
+    other n_ctx (verified: the first n_ctx-4 "X" placeholder embeddings got treated as frozen
+    prefix instead of learnable context).
 
     One learnable context tensor, `ctx` ([num_identities, num_branches*n_ctx, ctx_dim]), flat so
     TextualAttentionBlock can attend across all M=1+K branches at once (branch 0 = global/
@@ -46,10 +50,19 @@ class PromptLearner(nn.Module):
         ctx_dim = clip_text_encoder.transformer_width
         dtype = clip_text_encoder.dtype
 
-        ctx_init = "A photo of a " + " ".join(["X"] * n_ctx) + " person."
+        prefix_text = "A photo of a"
+        ctx_init = prefix_text + " " + " ".join(["X"] * n_ctx) + " person."
         tokenized_prompts = clip.tokenize(ctx_init).to(device)
         with torch.no_grad():
             embedding = clip_text_encoder.token_embedding(tokenized_prompts).type(dtype)
+
+        # Real length of "SOT + prefix_text", measured by tokenizing prefix_text on its own and
+        # dropping that isolated tokenization's own EOT -- independent of n_ctx, unlike the
+        # n_ctx+1 this used to assume (see class docstring). BPE tokenizes each word against its
+        # own trailing word-boundary marker, so a word's token id doesn't depend on what follows
+        # it -- prefix_text's tokens here are identical to its tokens inside ctx_init above.
+        prefix_only = clip.tokenize(prefix_text).to(device)
+        prefix_len = int((prefix_only != 0).sum().item()) - 1  # drop the isolated EOT, keep SOT
 
         num_branches = 1 + num_parts
 
@@ -66,8 +79,8 @@ class PromptLearner(nn.Module):
         # not trained, but must move with the module (.cuda()/.to()) -- registered as buffers
         # rather than plain attributes, unlike CLIP-ReID's own hardcoded .cuda() call
         self.register_buffer('tokenized_prompts', tokenized_prompts)  # [1, 77]
-        self.register_buffer('token_prefix', embedding[:, :n_ctx + 1, :])
-        self.register_buffer('token_suffix', embedding[:, n_ctx + 1 + n_ctx:, :])
+        self.register_buffer('token_prefix', embedding[:, :prefix_len, :])
+        self.register_buffer('token_suffix', embedding[:, prefix_len + n_ctx:, :])
 
         self.num_identities = num_identities
         self.num_parts = num_parts

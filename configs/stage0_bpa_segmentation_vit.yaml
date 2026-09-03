@@ -1,0 +1,38 @@
+# Stage 0, ViT-backbone variant: trains only PixelToPartClassifier (BN + 1x1 conv) on top of a
+# frozen CLIP ViT -- see examples/train_bpa_segmentation_vit.py's own module docstring. Backbone
+# choice (model.clip_arch) also fixes dim_reduce_output implicitly (= that arch's embed_dim, e.g.
+# 512 for ViT-B/16) -- no separate dim_reduce_output field, unlike the HRNet/ResNet configs, since
+# the backbone here can't be reduced to an arbitrary size the way a CNN's own head can.
+
+model:
+  clip_arch: ViT-B/16
+  checkpoint_path: ''        # optional: continue training an existing classifier checkpoint
+  parts_num: 5
+
+data:
+  dataset: market1501         # DukeMTMC-reID has no masks on disk -- market1501 only
+  data_dir: ../datasets
+  height: 384                 # -> 24x8 patch grid (was 256 -> 16x8): finer localization for
+                                # small parts (head, feet get ~4-5 grid rows instead of ~3), at
+                                # the cost of ~2.2x attention compute (sequence length squared) --
+                                # matches this repo's own usual resolution, departing from
+                                # CLIP-ReID's own 256x128 ViT-B/16 setting deliberately for this
+  width: 128
+  batch_size: 32
+  workers: 4
+  masks_dir: pifpaf_maskrcnn_filtering
+  masks_suffix: '.npy'
+
+optim:
+  # Only a tiny BN+1x1-conv head trains (linear-probe-style optimization landscape) -- higher LR
+  # and far fewer epochs than the HRNet/ResNet version's full-backbone training (lr 0.00035,
+  # epochs 60), which was tuned for a much harder, much higher-dimensional optimization problem.
+  lr: 0.001
+  weight_decay: 0.0005
+  epochs: 20
+  step_size: 10
+
+logging:
+  logs_dir: examples/logs/stage0_bpa_vit
+  print_freq: 10
+  seed: 1

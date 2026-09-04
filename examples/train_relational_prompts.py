@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from pcr import datasets
-from pcr.models.bpbreid_encoder import BPBReIDEncoder, BPBReIDModelCfg
+from pcr.models.clip_dense_part_encoder import ClipRN50BPAMEncoder
 from pcr.models.clip_image_encoder import ClipImageEncoder
 from pcr.models.clip_text_encoder import ClipTextEncoder
 from pcr.models.prompt_learner import PromptLearner
@@ -164,18 +164,18 @@ def relalign_schedule(epoch, total_epochs, relalign_cfg):
 
 
 def build_encoder(cfg):
-    model_cfg = BPBReIDModelCfg(backbone=cfg.model.backbone)
-    model_cfg.masks.parts_num = cfg.model.parts_num
-    model_cfg.dim_reduce_output = cfg.model.dim_reduce_output
-    # Continuous visibility scores, not the dataclass's own binary default -- needed for
-    # SupConLoss's per-part weighting to be meaningfully graduated rather than near-binary.
-    # Overridden only here (this stage's own bpb_img_encoder construction), not in BPBReIDModelCfg's
-    # shared default -- Stage 3 stays binary, untouched. Stage 1's bpb_img_encoder calls .eval()
-    # immediately below and never leaves eval mode, so testing_binary_visibility_score is the
-    # one that's actually reachable here; training_binary_visibility_score is set for symmetry.
-    model_cfg.training_binary_visibility_score = False
-    model_cfg.testing_binary_visibility_score = False
-    bpb_img_encoder = BPBReIDEncoder(model_cfg, checkpoint_path=cfg.model.checkpoint_path or None).cuda()
+    """CLIP's own RN50, reshaped to do BPAM's job natively: ClipRN50DenseBackbone drops layer4's
+    stride to 1 and re-invokes AttentionPool2d's own pretrained weights over every spatial
+    location (instead of only the mean-pooled token), so per-location identity survives instead
+    of collapsing into one pooled vector, and PixelToPartClassifier (BPAM's own class, reused
+    verbatim) sits directly on that dense output to emphasize body parts. No BPBreID/HRNet
+    anywhere in this path -- see plans/... (Stage 1 CLIP-ViT backbone pivot) for the full
+    rationale. checkpoint_path must point at a classifier trained by
+    examples/train_bpa_segmentation_rn50.py (Stage 0's RN50 variant), not the HRNet or ViT one."""
+    bpb_img_encoder = ClipRN50BPAMEncoder(
+        clip_arch=cfg.clip.arch, height=cfg.data.height, width=cfg.data.width,
+        num_parts=cfg.model.parts_num, checkpoint_path=cfg.model.checkpoint_path or None,
+        device='cuda').cuda()
     bpb_img_encoder.eval()
     for p in bpb_img_encoder.parameters():
         p.requires_grad_(False)
@@ -216,7 +216,7 @@ def main_worker(cfg, setup_only=False):
     prompt_learner = PromptLearner(num_pids, num_parts, clip_txt_encoder, n_ctx=cfg.clip.n_ctx,
                                     tab_num_heads=cfg.tab.num_heads, tab_num_layers=cfg.tab.num_layers,
                                     device='cuda').cuda()
-    vab = VisualAttentionBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.vab.num_heads,
+    vab = VisualAttentionBlock(dim=bpb_img_encoder.num_features, num_heads=cfg.vab.num_heads,
                                num_layers=cfg.vab.num_layers).cuda()
 
     cache_loader = get_cache_loader(sorted(dataset.train), dataset.images_dir, cfg.data.height, cfg.data.width,

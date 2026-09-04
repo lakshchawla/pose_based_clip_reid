@@ -1,37 +1,52 @@
 # Stage 1: per-branch CLIP prompt learning, with relational mixing across a person's M=1+K
 # branches (global/foreground + K parts, uniformly) on both sides -- TextualAttentionBlock (owned
-# by PromptLearner) on the text side, VisualAttentionBlock on the image side. BPBreID backbone,
-# the CLIP text encoder, and the CLIP image encoder are all frozen; only ctx (incl.
+# by PromptLearner) on the text side, VisualAttentionBlock on the image side.
+#
+# Image side (build_encoder() in examples/train_relational_prompts.py): ClipRN50BPAMEncoder --
+# BPAM's own PixelToPartClassifier sitting directly on CLIP's own frozen RN50 (layer4's stride
+# dropped to 1 + AttentionPool2d re-invoked over every location instead of just the mean-pooled
+# token, both using pretrained weights unchanged -- see pcr/models/clip_dense_part_encoder.py).
+# No BPBreID/HRNet anywhere in this stage anymore: the image and text sides now share CLIP's own
+# pretrained joint embedding space instead of two independently-trained spaces that only happened
+# to match in dimension. CLIP's text encoder is frozen too; only ctx (incl.
 # TextualAttentionBlock) and VisualAttentionBlock train -- see
 # examples/train_relational_prompts.py's own docstring for the full Algorithm 1 this file's
 # script now follows exactly. Run examples/cache_text_anchors.py against this same config
 # afterward to build Stage 2's frozen text-prototype table.
 #
-# Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the tab:/vab:
-# sections below are the new content relative to that file. No visibility: section -- the
-# upstream image-level filter this used to configure was removed (see progress.md's entry on
-# this); every image is used, weighted per-part inside SupConLoss instead.
+# Known limitation, not yet relevant to this stage: ClipTextEncoder.encode_branch_self_attention
+# (CAB's Stage 2 precompute step) asserts embed_dim == transformer_width, which holds for
+# ViT-B/16 (both 512) but NOT RN50 (1024 vs 512) -- CAB will need a different precompute path
+# before Stage 2 can use this same clip.arch.
+#
+# No visibility: section -- the upstream image-level filter this used to configure was removed
+# (see progress.md's entry on this); every image is used, weighted per-part inside SupConLoss
+# instead.
 
 model:
-  backbone: hrnet32          # or resnet50 -- must match Stage 0's own backbone
   # Algorithm 1's own initialization step: load Stage 0's converged checkpoint, not ImageNet
-  # init -- run examples/train_bpa_segmentation.py first (configs/stage0_bpa_segmentation.yaml)
-  # to produce this file.
-  checkpoint_path: 'examples/logs/stage0_bpa_768/model_best.pth.tar'
-  dim_reduce_output: 768     # must equal clip.arch's text embed dim (768 for ViT-L/14 and ViT-L/14@336px)
+  # init -- run examples/train_bpa_segmentation_rn50.py first
+  # (configs/stage0_bpa_segmentation_rn50.yaml) to produce this file. Must be a checkpoint trained
+  # at the same clip.arch as below -- PixelToPartClassifier's conv is shape-locked to that arch's
+  # backbone width (2048 for RN50, the channel count feeding AttentionPool2d).
+  checkpoint_path: 'examples/logs/stage0_bpa_rn50/model_best.pth.tar'
   parts_num: 5                # K body parts; num_branches = 1 (foreground) + parts_num
 
 clip:
-  arch: ViT-L/14@336px         # 768-dim text embedding, matching model.dim_reduce_output above --
-                                # transformer_width also 768 (== embed_dim, verified directly) so
-                                # pcr/models/clip_text_encoder.py's encode_branch_self_attention
-                                # (CAB's Stage 2 precompute step) stays valid -- see that method's
-                                # own assertion. See clip_text_encoder.py's own docstring for other
-                                # archs' sizes.
-  n_ctx: 8                    # learnable context tokens per (identity, branch) -- bumped from 4;
-                                # safe now that PromptLearner measures the frozen prefix's real
-                                # token length instead of assuming it equals n_ctx (see that
-                                # class's own docstring)
+  arch: RN50                    # drives BOTH clip_txt_encoder and the image side's
+                                 # ClipRN50BPAMEncoder (see build_encoder()) -- one field, so the
+                                 # two towers can never end up mismatched. 1024-dim embed_dim (the
+                                 # dimension SupCon actually compares on); transformer_width is
+                                 # 512 (the text transformer's own internal width, unrelated to
+                                 # this) -- see pcr/models/clip_text_encoder.py's own docstring on
+                                 # why these two numbers differ for RN50 specifically. Reusing the
+                                 # exact arch the Stage 0 checkpoint above was trained on is
+                                 # required -- CLIP's image/text towers only share a real
+                                 # pretrained joint space when both come from the same
+                                 # clip.load(arch) call.
+  n_ctx: 4                     # back to 4 -- n_ctx=8 measured equal-or-slightly-worse earlier
+                                # this session (likely overfitting; 4 was already enough to
+                                # capture each part distinctly)
 
 tab:
   num_heads: 4                 # TextualAttentionBlock's attention heads, over all M=1+K branches
@@ -82,6 +97,6 @@ loss:
   temperature: 0.1
 
 logging:
-  logs_dir: examples/logs/stage1_prompts_768   # separate from the 512-dim run's own dir
+  logs_dir: examples/logs/stage1_prompts_clipvit   # separate from the old BPBreID-backbone run's dir
   print_freq: 10
   seed: 1

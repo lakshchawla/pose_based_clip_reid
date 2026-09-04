@@ -1,23 +1,31 @@
-"""Turns CLIP's own frozen ViT into a dense, per-patch feature extractor (ClipViTDenseBackbone),
-then classifies each patch into part maps two different ways:
+"""Turns one of CLIP's own frozen visual towers into a dense, per-location feature extractor --
+ClipViTDenseBackbone for ViT-family archs, ClipRN50DenseBackbone for RN-family archs (both of
+CLIP-ReID's own two officially-pretrained backbone choices) -- then classifies each location into
+part maps two different ways:
 
   ClipDensePartEncoder -- zero-training: cosine similarity against a handful of fixed body-part
     text prompts. No BPAM checkpoint needed, but the raw similarity spread between classes turned
     out too small relative to per-patch noise for fine body-part discrimination on ReID crops
     (measured directly, not assumed) -- kept here for reference/comparison, not the current path.
+    ViT-only (never ported to RN50).
 
-  ClipViTBPAMEncoder -- supervised: a real, trained PixelToPartClassifier (bpbreid's own class,
-    reused verbatim) sits on top of the frozen backbone's dense features and is trained with real
-    masks (examples/train_bpa_segmentation_vit.py), exactly like today's Stage 0 does for HRNet/
-    ResNet -- just with a frozen ViT backbone instead of a trainable CNN one, so only the small
-    classifier head ever needs training.
+  ClipBPAMEncoder -- supervised, backbone-agnostic: a real, trained PixelToPartClassifier
+    (bpbreid's own class, reused verbatim) sits on top of whichever frozen dense backbone it's
+    given and is trained with real masks (examples/train_bpa_segmentation_vit.py /
+    train_bpa_segmentation_rn50.py), exactly like today's Stage 0 does for HRNet/ResNet -- just
+    with a frozen CLIP backbone instead of a trainable CNN one, so only the small classifier head
+    ever needs training. ClipViTBPAMEncoder/ClipRN50BPAMEncoder are thin constructors around it.
 
-Both share ClipViTDenseBackbone and honor BPBReIDEncoder's own interface (forward -> (f_out, vis),
-forward_full adding pixels_cls_scores, num_features, num_parts) so either drops into every
-existing consumer (Stage 1/2 training loops, the evaluator, Stage 3) unchanged. See the
-"CLIP Backbone Pivot" artifact and this session's own discussion for the full design rationale
-(CLIP Surgery / SCLIP's "V-V attention" trick for keeping per-patch identity through the last
-transformer block instead of letting it collapse into one CLS summary).
+Both dense backbones solve the same underlying problem -- CLIP was pretrained to collapse every
+image down to ONE embedding, but BPAM needs each spatial location to keep its own -- with a
+surgery specific to where that collapse actually happens in each architecture: ViT's last
+transformer block (Q-K attention swapped for V-V/"value-based" attention, CLIP Surgery/SCLIP's
+trick) vs. RN50's AttentionPool2d (re-invoked with every location as query instead of only the
+mean-pooled token, using its own pretrained weights unchanged). All three encoder classes honor
+BPBReIDEncoder's own interface (forward -> (f_out, vis), forward_full adding pixels_cls_scores,
+num_features, num_parts) so any of them drops into every existing consumer (Stage 1/2 training
+loops, the evaluator, Stage 3) unchanged. See the "CLIP Backbone Pivot" artifact and this
+session's own discussion for the full design rationale.
 """
 import clip
 import torch
@@ -139,17 +147,128 @@ def _gwap_pool(mask, feats):
     return weighted.sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1e-6)
 
 
-class ClipViTBPAMEncoder(nn.Module):
-    """Supervised path: ClipViTDenseBackbone (frozen) + a real, trained PixelToPartClassifier
-    (bpbreid's own class, reused verbatim) -- trained by examples/train_bpa_segmentation_vit.py
-    against real masks, exactly like today's HRNet/ResNet Stage 0, just with a frozen backbone so
-    only the classifier's own small BN+1x1-conv head ever needs a gradient. Load the trained
-    classifier's state_dict before using this for Stage 1/2 (see checkpoint_path)."""
+class ClipRN50DenseBackbone(nn.Module):
+    """Frozen CLIP RN50 (ModifiedResNet), modified at two points so per-location identity survives
+    to the output instead of being discarded the way stock CLIP discards it:
 
-    def __init__(self, clip_arch='ViT-B/16', height=256, width=128, num_parts=5,
-                 checkpoint_path=None, device='cuda'):
-        super(ClipViTBPAMEncoder, self).__init__()
-        self.backbone = ClipViTDenseBackbone(clip_arch, height, width, device)
+    1. layer4's stride is dropped from 2 to 1 (the standard ReID "last-stride" trick -- the same
+       one BPBreID's own `last_stride` config applies to its resnet50/hrnet32 backbones), keeping
+       the final grid 2x finer for small body parts. CLIP's own Bottleneck (third_party/clip/
+       model.py) encodes stride entirely via parameter-free nn.AvgPool2d(stride) layers -- every
+       conv in it is stride=1 always -- so this is done by swapping those two AvgPool2d(2)
+       instances (the main branch's post-conv2 one and the shortcut's pre-conv one) for
+       nn.Identity(); no pretrained weight is touched or needs retraining.
+    2. AttentionPool2d's own forward only ever lets ONE token (the spatial mean) serve as query,
+       discarding every individual location's own post-attention representation (`query=x[:1]` in
+       third_party/clip/model.py -- verified directly in the installed package, not assumed).
+       `project()` below re-invokes that same layer's pretrained q_proj/k_proj/v_proj/c_proj
+       weights, completely unchanged, but with every location serving as both query and key/value
+       -- so every patch keeps its own joint-space embedding instead of collapsing into one vector.
+
+    Same interface as ClipViTDenseBackbone (forward -> raw [B,N,vision_width], project -> joint
+    [B,N,embed_dim], grid_h/grid_w) so ClipBPAMEncoder below is backbone-agnostic between the two.
+    """
+
+    def __init__(self, clip_arch='RN50', height=256, width=128, device='cuda'):
+        super(ClipRN50DenseBackbone, self).__init__()
+        clip_model, _ = clip.load(clip_arch, device=device, jit=False)
+        visual = clip_model.visual
+        assert hasattr(visual, 'attnpool'), (
+            "needs an RN-family CLIP arch (conv backbone + AttentionPool2d) -- ViT-based CLIP "
+            "visual towers have no such pooling head (see ClipViTDenseBackbone instead).")
+
+        self.dtype = clip_model.dtype
+        self.conv1, self.bn1, self.relu1 = visual.conv1, visual.bn1, visual.relu1
+        self.conv2, self.bn2, self.relu2 = visual.conv2, visual.bn2, visual.relu2
+        self.conv3, self.bn3, self.relu3 = visual.conv3, visual.bn3, visual.relu3
+        self.avgpool = visual.avgpool
+        self.layer1 = visual.layer1
+        self.layer2 = visual.layer2
+        self.layer3 = visual.layer3
+        self.layer4 = visual.layer4
+        self._drop_last_stride(self.layer4)
+
+        self.attnpool = visual.attnpool
+        self.vision_width = self.attnpool.k_proj.in_features   # 2048 for RN50: channels into attnpool
+        self.embed_dim = self.attnpool.c_proj.out_features     # 1024 for RN50: final joint-space dim
+        self.num_heads = self.attnpool.num_heads
+
+        # Stock total downsampling is 32x (stem 4x, layer2 2x, layer3 2x, layer4 2x); dropping
+        # layer4's stride above makes it 16x -- the grid attnpool's own pretrained
+        # positional_embedding was fit to (visual.input_resolution // 32) is smaller than the one
+        # actually reached now, same bicubic-interpolation fix ClipViTDenseBackbone already needed
+        # for its own (non-square, non-224px) grid mismatch.
+        orig_grid = visual.input_resolution // 32
+        new_grid = (height // 16, width // 16)
+        pos_embed = _interpolate_pos_embed(self.attnpool.positional_embedding.float(), orig_grid, new_grid)
+        self.register_buffer('positional_embedding', pos_embed.type(self.dtype))
+        self.grid_h, self.grid_w = new_grid
+
+        for p in self.parameters():
+            p.requires_grad_(False)
+        self.eval()
+
+    @staticmethod
+    def _drop_last_stride(layer4):
+        first_block = layer4[0]
+        first_block.avgpool = nn.Identity()
+        if first_block.downsample is not None:
+            first_block.downsample[0] = nn.Identity()  # the "-1" AvgPool2d(stride) entry
+
+    def forward(self, images):
+        """images: [B, 3, H, W], CLIP-normalized. Returns patch_feats [B, grid_h*grid_w,
+        vision_width] (raw conv features, pre attention-pool) -- same convention as
+        ClipViTDenseBackbone.forward: every location individually carried to the output."""
+        x = images.type(self.dtype)
+        x = self.relu1(self.bn1(self.conv1(x)))
+        x = self.relu2(self.bn2(self.conv2(x)))
+        x = self.relu3(self.bn3(self.conv3(x)))
+        x = self.avgpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)  # [B, vision_width, grid_h, grid_w]
+        B, C, H, W = x.shape
+        return x.reshape(B, C, H * W).permute(0, 2, 1).float()  # [B, N, vision_width]
+
+    def project(self, patch_feats):
+        """patch_feats: [B, N, vision_width] (raw, from forward()). Re-runs AttentionPool2d's own
+        pretrained weights with every location as both query and key/value (see class docstring
+        point 2) instead of stock CLIP's mean-token-only query. Cast to float32 to match this
+        repo's convention for every embedding a loss touches."""
+        B, N, C = patch_feats.shape
+        x = patch_feats.permute(1, 0, 2).type(self.dtype)  # NLC -> LNC, matches attnpool's own layout
+        mean_tok = x.mean(dim=0, keepdim=True)
+        x = torch.cat([mean_tok, x], dim=0)  # [1+N, B, C]
+        x = x + self.positional_embedding[:, None, :].to(x.dtype)
+        ap = self.attnpool
+        out, _ = F.multi_head_attention_forward(
+            query=x, key=x, value=x,
+            embed_dim_to_check=x.shape[-1], num_heads=self.num_heads,
+            q_proj_weight=ap.q_proj.weight, k_proj_weight=ap.k_proj.weight, v_proj_weight=ap.v_proj.weight,
+            in_proj_weight=None,
+            in_proj_bias=torch.cat([ap.q_proj.bias, ap.k_proj.bias, ap.v_proj.bias]),
+            bias_k=None, bias_v=None, add_zero_attn=False, dropout_p=0.0,
+            out_proj_weight=ap.c_proj.weight, out_proj_bias=ap.c_proj.bias,
+            use_separate_proj_weight=True, training=False, need_weights=False)
+        return out[1:].permute(1, 0, 2).float()  # drop the mean token, LNC -> NLC: [B, N, embed_dim]
+
+
+class ClipBPAMEncoder(nn.Module):
+    """Backbone-agnostic supervised BPAM encoder: any frozen dense CLIP backbone exposing
+    forward()->[B,N,vision_width], project()->[B,N,embed_dim] and grid_h/grid_w (ViT or RN50,
+    ClipViTDenseBackbone/ClipRN50DenseBackbone above), plus a real, trained PixelToPartClassifier
+    (bpbreid's own class, reused verbatim) on top -- trained against real masks by
+    examples/train_bpa_segmentation_vit.py/train_bpa_segmentation_rn50.py, exactly like today's
+    HRNet/ResNet Stage 0, just with a frozen backbone so only the classifier's own small
+    BN+1x1-conv head ever needs a gradient. Load the trained classifier's state_dict before using
+    this for Stage 1/2 (see checkpoint_path). ClipViTBPAMEncoder/ClipRN50BPAMEncoder below are
+    thin constructors that build the right backbone; this class's own logic doesn't care which one
+    it got."""
+
+    def __init__(self, backbone, num_parts=5, checkpoint_path=None, device='cuda'):
+        super(ClipBPAMEncoder, self).__init__()
+        self.backbone = backbone
         self.num_parts = num_parts
         self.num_features = self.backbone.embed_dim
         self.pixel_classifier = PixelToPartClassifier(self.backbone.vision_width, num_parts).to(device)
@@ -187,6 +306,18 @@ class ClipViTBPAMEncoder(nn.Module):
 
     def forward_full(self, images):
         return self._forward_common(images)
+
+
+def ClipViTBPAMEncoder(clip_arch='ViT-B/16', height=256, width=128, num_parts=5,
+                        checkpoint_path=None, device='cuda'):
+    backbone = ClipViTDenseBackbone(clip_arch, height, width, device)
+    return ClipBPAMEncoder(backbone, num_parts, checkpoint_path, device)
+
+
+def ClipRN50BPAMEncoder(clip_arch='RN50', height=256, width=128, num_parts=5,
+                         checkpoint_path=None, device='cuda'):
+    backbone = ClipRN50DenseBackbone(clip_arch, height, width, device)
+    return ClipBPAMEncoder(backbone, num_parts, checkpoint_path, device)
 
 
 class ClipDensePartEncoder(nn.Module):

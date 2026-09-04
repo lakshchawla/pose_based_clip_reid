@@ -12,8 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from pcr import datasets
-from pcr.models.clip_dense_part_encoder import ClipRN50BPAMEncoder
-from pcr.models.clip_image_encoder import ClipImageEncoder
+from pcr.models.clip_dense_part_encoder import ClipRN50BPAMEncoder, CLIP_MEAN, CLIP_STD
 from pcr.models.clip_text_encoder import ClipTextEncoder
 from pcr.models.prompt_learner import PromptLearner
 from pcr.models.relation_blocks import VisualAttentionBlock
@@ -32,7 +31,11 @@ def get_data(name, data_dir):
 
 
 def get_cache_loader(dataset_list, root, height, width, batch_size, workers):
-    normalizer = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    # CLIP's own normalization, not ImageNet's -- the frozen RN50 backbone (both its conv layers
+    # and AttentionPool2d) is calibrated to this specific normalization; using ImageNet stats
+    # wouldn't crash anything, it would just silently feed miscalibrated pixels to every frozen
+    # weight in the encoder.
+    normalizer = T.Normalize(mean=list(CLIP_MEAN), std=list(CLIP_STD))
     transformer = T.Compose([
         T.Resize((height, width), interpolation=3),
         T.ToTensor(),
@@ -212,7 +215,10 @@ def main_worker(cfg, setup_only=False):
 
     bpb_img_encoder = build_encoder(cfg)
     clip_txt_encoder = ClipTextEncoder(clip_arch=cfg.clip.arch, device='cuda').cuda()
-    clip_img_encoder = ClipImageEncoder(clip_arch=cfg.clip.arch, device='cuda').cuda()
+    # No separate ClipImageEncoder here (Algorithm 1's own "load CLIP's image encoder" step,
+    # kept as a formality by earlier versions of this script): ClipRN50BPAMEncoder above IS the
+    # real, working CLIP image encoder now -- a second, independent copy of the same pretrained
+    # weights would just sit in GPU memory unused.
     prompt_learner = PromptLearner(num_pids, num_parts, clip_txt_encoder, n_ctx=cfg.clip.n_ctx,
                                     tab_num_heads=cfg.tab.num_heads, tab_num_layers=cfg.tab.num_layers,
                                     device='cuda').cuda()
@@ -305,6 +311,15 @@ def main_worker(cfg, setup_only=False):
                     clip_txt_encoder(prompts[m], prompt_learner.tokenized_prompts).float(), p=2, dim=-1)
                 visual_m = branch_visual[:, m, :]
                 w_m = b_vis[:, m]
+
+                # Write this batch's fresh row straight back into the snapshot (detached) --
+                # otherwise these identities' snapshot entries stay as stale as they were at the
+                # start of the epoch until the next epoch's rebuild, even though we just computed
+                # their current value for free. Bounds per-identity staleness to ~1 iteration for
+                # anyone recently seen; doesn't fix drift from TAB's shared weights moving on
+                # every iteration regardless of which identities are in the batch, but removes the
+                # larger, free-to-fix half of it. See build_text_snapshot's own docstring.
+                text_snapshot[b_labels, m, :] = branch_text.detach()
 
                 # i2t: full num_pids-way classification, not just this batch's ~8 -- this
                 # batch's own identities keep their fresh, differentiable text row (gradient must

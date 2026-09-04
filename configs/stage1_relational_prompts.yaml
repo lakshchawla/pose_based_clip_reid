@@ -89,11 +89,12 @@ optim:
   lr_min: 0.000001
 
 loss:
-  # Initial value only -- SupConLoss's temperature is learnable (see that file's own docstring)
-  # and logged every epoch. 0.1, not SupConLoss's own original 1.0 (CLIP-ReID's value, tuned for
-  # comparing against one small batch's worth of identities): this loss compares against the full
-  # training set (751 identities / 12936 images) every step, and needs a sharper starting
-  # temperature to give a useful gradient at that scale from the first step onward.
+  # Fixed for the whole run, not learned -- see SupConLoss's own docstring (pcr/loss/
+  # clip_supcon_loss.py) for the real instability a learnable version caused. 0.1, not
+  # SupConLoss's own original 1.0 (CLIP-ReID's value, tuned for comparing against one small
+  # batch's worth of identities): this loss compares against the full training set (751
+  # identities / 12936 images) every step, and needs a sharper temperature to give a useful
+  # gradient at that scale from the first step onward.
   temperature: 0.1
 
 logging:

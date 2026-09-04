@@ -245,10 +245,11 @@ def main_worker(cfg, setup_only=False):
 
     supcon = SupConLoss(temperature=cfg.loss.temperature).cuda()
     # ctx (all M=1+K branches, global/foreground included), TextualAttentionBlock
-    # (prompt_learner.tab), VisualAttentionBlock, and SupConLoss's own learnable temperature
-    # (see that file's own docstring) all train.
+    # (prompt_learner.tab), and VisualAttentionBlock train. SupConLoss's temperature is fixed,
+    # not trained -- see that file's own docstring for why a learnable version caused real
+    # instability.
     trainable_params = ([prompt_learner.ctx] + list(prompt_learner.tab.parameters())
-                         + list(vab.parameters()) + list(supcon.parameters()))
+                         + list(vab.parameters()))
     optimizer = torch.optim.Adam(trainable_params, lr=cfg.optim.lr,
                                   weight_decay=cfg.optim.weight_decay)
     scheduler = WarmupCosineLR(optimizer, max_epochs=cfg.optim.epochs,
@@ -356,7 +357,7 @@ def main_worker(cfg, setup_only=False):
 
         scheduler.step()
         print('Epoch {} done in {:.1f}s, avg loss {:.4f}, SupCon temperature {:.4f}'.format(
-            epoch, time.time() - epoch_start, epoch_loss / iters_per_epoch, supcon.temperature.item()))
+            epoch, time.time() - epoch_start, epoch_loss / iters_per_epoch, supcon.temperature))
 
     torch.save(prompt_learner.state_dict(), osp.join(cfg.logging.logs_dir, 'prompt_learner.pth'))
     torch.save(vab.state_dict(), osp.join(cfg.logging.logs_dir, 'vab.pth'))
